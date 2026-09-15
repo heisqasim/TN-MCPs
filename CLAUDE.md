@@ -16,10 +16,11 @@ Before changing anything, read in this order:
 
 ## Current phase
 
-**Phase 2: thin gateway + first MCP skeleton** (contract P1), owner-approved 2026-09-15,
-in progress on branch `phase-2-gateway-skeleton`. It is local and loopback-only:
-`tn_status` only, no provider credentials, no DNS/Access/Tunnel changes, no deployment.
-It lands on `main` through a PR. Phase 1 is complete apart from the owner's GitHub
+**Phase 2: thin gateway + first MCP skeleton** (contract P1) is complete on PR #2
+(branch `phase-2-gateway-skeleton`), pending the owner's merge to `main`. It is local
+and loopback-only: `tn_status` only, no provider credentials, no DNS/Access/Tunnel
+changes, no deployment. Next: **Phase 3: policy, audit, approvals framework**, which
+starts only after PR #2 is merged. Phase 1 is complete apart from the owner's GitHub
 settings (Owner Actions §1).
 Don't start a phase until its predecessor's exit criteria are met.
 

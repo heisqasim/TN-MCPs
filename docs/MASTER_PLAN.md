@@ -9,7 +9,7 @@ diverge, update the plan in the same change.
 - Host: Oracle Cloud A1 VM (see [DEPLOYMENT_A1.md](DEPLOYMENT_A1.md))
 - Public endpoints: `https://mcp.telosnexus.cloud/{cloudflare,github,oracle,telos}/mcp`
 - Plan written: 2026-09-15 · Revision 3 (owner-contract alignment; see Part D) ·
-  Current phase: **2: Thin gateway + first MCP skeleton (in progress, owner-approved 2026-09-15)**
+  Current phase: **2: Thin gateway + first MCP skeleton (complete on PR #2, pending owner merge)**; next: **3: Policy, audit, approvals framework**
 
 ## Relationship to the owner's contract
 
@@ -382,7 +382,7 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 
 ---
 
-### Phase 2: Thin gateway + first MCP skeleton (local only)
+### Phase 2: Thin gateway + first MCP skeleton (local only): complete on PR #2, pending merge
 
 - **Goal:** a dual-era `mcps/cloudflare` server on `127.0.0.1:8701`, reached only
   through the thin gateway on `127.0.0.1:8790/cloudflare/mcp`, with the harmless R0
@@ -454,6 +454,12 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 - **Must NOT happen:** non-loopback bind; provider credentials; production deployment;
   development auth reachable outside development.
 - **Exit criteria:** WPs 2.1–2.5 landed; B1, B2 call-site half, B5, B6, B7 enforced.
+  Status 2026-09-15: all met on branch `phase-2-gateway-skeleton` (PR #2, final commit
+  `50dd06b`): `pnpm run check` green locally and in CI (run 35016318186, 302 tests,
+  secret guard and boundary check passing); the gateway test file passed 20
+  consecutive runs; WP 2.5 local Claude Code gate passed (tools `["tn_status"]`,
+  `tn_status` answered with spec 2026-07-28, modern era; no token in any output).
+  Phase 2 counts as done per A.6 once the owner merges PR #2 to `main`.
 - **Implementation notes (2026-09-15):** WP 2.6 added hardening from two independent
   code reviews (connection handling, edge-header tripwire, known-secret scrubbing,
   production refusal of test-only overrides, boundary-gate bypasses, request-desync
