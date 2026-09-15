@@ -213,6 +213,7 @@ Claude Code → **Operational readiness** → **Writes**:
 ```ts
 interface ToolDefinition<I extends z.ZodType> {
   name: string;                         // <provider>_<verb>_<object>, ASCII snake_case
+  description: string;                  // what the model sees; 1-1024 chars, required
   provider: string;
   risk: 'R0' | 'R1' | 'R2' | 'R3';
   scopes: string[];                     // e.g. ['cloudflare:dns:write']

@@ -1,5 +1,10 @@
 export { ConfigError, loadConfig } from './config.js';
 export {
+  createHttpLifecycle,
+  type HttpLifecycle,
+  type HttpLifecycleOptions,
+} from './http-lifecycle.js';
+export {
   type RedactOptions,
   redact,
   SECRET_KEY_PATTERNS,

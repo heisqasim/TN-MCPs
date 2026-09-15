@@ -4,6 +4,7 @@
     { "path": "./packages/shared" },
     { "path": "./packages/config" },
     { "path": "./packages/observability" },
-    { "path": "./packages/auth" }
+    { "path": "./packages/auth" },
+    { "path": "./packages/mcp-common" }
   ]
 }

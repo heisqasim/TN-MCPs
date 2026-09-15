@@ -1,0 +1,30 @@
+{
+  "name": "@tn-mcps/mcp-common",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "@tn-mcps/auth": "workspace:*",
+    "@tn-mcps/config": "workspace:*",
+    "@tn-mcps/observability": "workspace:*",
+    "@tn-mcps/shared": "workspace:*",
+    "hono": "4.13.7",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
+  }
+}
