@@ -28,12 +28,12 @@ clients. The durable asset is TN-MCPs plus Telos policy.
 
 ## Status
 
-**Phase 1 (of phases 0–15): repository foundation.** Nothing is deployed and
+**Phases 0–1 are complete. Phase 2 (of phases 0–15), the thin gateway + first MCP
+skeleton (local only), is complete on PR #2, pending merge.** Nothing is deployed and
 `mcp.telosnexus.cloud` does not exist yet. The owner's architecture and security
 contract is [docs/TN_MCPS_MASTER_IMPLEMENTATION_PLAN.md](docs/TN_MCPS_MASTER_IMPLEMENTATION_PLAN.md).
 The phased execution plan that implements it, including the owner-approved deviations,
-is [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md). Phase 2 (thin gateway + first MCP skeleton,
-local only) is complete on PR #2, pending merge.
+is [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md).
 
 ## Stack
 
