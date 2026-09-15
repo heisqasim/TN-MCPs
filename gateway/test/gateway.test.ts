@@ -584,6 +584,102 @@ describe('gateway limits and upstream failure mapping', () => {
     }
   });
 
+  it('answers 413 for an over-limit chunked body even when the backend consumes it', async () => {
+    const consuming = createServer((incoming, response) => {
+      incoming.resume();
+      incoming.on('end', () => {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end('{"consumed":true}');
+      });
+    });
+    const backendUrl = await listen(consuming);
+    const gateway = await startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      routeTargets: { cloudflare: `${backendUrl}/mcp` },
+    });
+    try {
+      const response = await request(new URL('/cloudflare/mcp', gateway.url), {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${developmentCredential}`,
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+        },
+        chunks: [Buffer.alloc(MAX_BODY_BYTES, 97), Buffer.from('x')],
+      });
+      expect(response.status).toBe(413);
+      expect(JSON.parse(response.body)).toEqual({ error: 'request body too large' });
+    } finally {
+      await gateway.close();
+      await closeServer(consuming);
+    }
+  });
+
+  it('answers 413 for an over-limit chunked body even when the backend is down', async () => {
+    const portHolder = createServer();
+    const unavailableUrl = await listen(portHolder);
+    await closeServer(portHolder);
+    const gateway = await startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      routeTargets: { cloudflare: `${unavailableUrl}/mcp` },
+    });
+    try {
+      const oversized = await request(new URL('/cloudflare/mcp', gateway.url), {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${developmentCredential}`,
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+        },
+        chunks: [Buffer.alloc(MAX_BODY_BYTES, 97), Buffer.from('x')],
+      });
+      expect(oversized.status).toBe(413);
+      expect(JSON.parse(oversized.body)).toEqual({ error: 'request body too large' });
+
+      // A body within the limit keeps the backend-failure mapping.
+      const small = await request(new URL('/cloudflare/mcp', gateway.url), {
+        method: 'POST',
+        headers: authenticatedHeaders('{}'),
+        chunks: ['{}'],
+      });
+      expect(small.status).toBe(503);
+      expect(JSON.parse(small.body)).toEqual({ error: 'backend unavailable' });
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it('forwards an early upstream response when the body stays within the limit', async () => {
+    const early = createServer((_incoming, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{"early":true}');
+    });
+    const backendUrl = await listen(early);
+    const gateway = await startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      routeTargets: { cloudflare: `${backendUrl}/mcp` },
+    });
+    try {
+      const response = await request(new URL('/cloudflare/mcp', gateway.url), {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${developmentCredential}`,
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+        },
+        chunks: ['{}'],
+      });
+      expect(response.status).toBe(200);
+      expect(response.body).toBe('{"early":true}');
+    } finally {
+      await gateway.close();
+      await closeServer(early);
+    }
+  });
+
   it('maps a hanging backend to 504', async () => {
     const backend = createServer(() => undefined);
     const backendUrl = await listen(backend);

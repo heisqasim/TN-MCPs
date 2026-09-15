@@ -528,6 +528,7 @@ export async function startGateway(
         let clientDisconnected = false;
         let upstreamTimedOut = false;
         let upstreamSettled = false;
+        let deferredFailure = false;
         let requestBodyComplete = false;
         let pendingUpstreamResponse: IncomingMessage | undefined;
 
@@ -559,6 +560,14 @@ export async function startGateway(
           upstreamResponse.pipe(response);
         };
 
+        // Once the upstream has failed or answered, further client body bytes are
+        // counted and discarded, never written or stored, so the byte-count decision
+        // (413 vs the deferred upstream outcome) stays the gateway's own.
+        const discardRemainingBody = (): void => {
+          upstreamSettled = true;
+          request.resume();
+        };
+
         const upstreamRequest = httpRequest(
           target,
           {
@@ -568,8 +577,12 @@ export async function startGateway(
           },
           (upstreamResponse) => {
             if (!requestBodyComplete) {
+              // The upstream answered while the client body was still arriving:
+              // hold the response, stop writing upstream, and keep counting the
+              // body so an over-limit request still answers 413 deterministically.
               pendingUpstreamResponse = upstreamResponse;
               upstreamResponse.pause();
+              discardRemainingBody();
               return;
             }
             forwardUpstreamResponse(upstreamResponse);
@@ -577,7 +590,21 @@ export async function startGateway(
         );
 
         const timeout = setTimeout(() => {
-          if (upstreamSettled || bodyTooLarge || clientDisconnected) {
+          if (upstreamTimedOut || bodyTooLarge || clientDisconnected) {
+            return;
+          }
+          if (upstreamSettled && !requestBodyComplete) {
+            // The upstream failed or answered, but the client never finished the
+            // body it promised. Stop waiting; the body limit no longer applies.
+            upstreamTimedOut = true;
+            pendingUpstreamResponse?.destroy();
+            if (response.headersSent) {
+              response.destroy();
+            } else if (deferredFailure) {
+              rejectJson(request, response, 503, { error: 'backend unavailable' });
+            } else {
+              rejectJson(request, response, 504, { error: 'upstream timeout' });
+            }
             return;
           }
           upstreamTimedOut = true;
@@ -592,16 +619,25 @@ export async function startGateway(
         timeout.unref();
 
         upstreamRequest.once('error', () => {
-          clearTimeout(timeout);
           if (bodyTooLarge || clientDisconnected || upstreamTimedOut) {
             return;
           }
-          upstreamSettled = true;
-          if (response.headersSent) {
-            response.destroy();
-          } else {
-            rejectJson(request, response, 503, { error: 'backend unavailable' });
+          if (requestBodyComplete) {
+            clearTimeout(timeout);
+            upstreamSettled = true;
+            if (response.headersSent) {
+              response.destroy();
+            } else {
+              rejectJson(request, response, 503, { error: 'backend unavailable' });
+            }
+            return;
           }
+          // The upstream died while the client was still sending the body. Defer the
+          // outcome until the body completes: an over-limit body must answer 413 no
+          // matter when the backend gave up. An already-received response survives
+          // and is forwarded once the body completes within the limit.
+          deferredFailure = true;
+          discardRemainingBody();
         });
 
         let waitingForUpstreamDrain = false;
@@ -622,7 +658,7 @@ export async function startGateway(
         response.once('close', abortUpstream);
 
         request.on('data', (chunk: Buffer | string) => {
-          if (bodyTooLarge || clientDisconnected || upstreamTimedOut || upstreamSettled) {
+          if (bodyTooLarge || clientDisconnected || upstreamTimedOut) {
             return;
           }
           const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -639,6 +675,11 @@ export async function startGateway(
             }
             return;
           }
+          if (upstreamSettled) {
+            // The upstream already failed or answered: discard the remainder of the
+            // body (counted above, never stored) until it completes.
+            return;
+          }
           if (!upstreamRequest.write(buffer)) {
             // At most one pending drain listener at a time; a fresh once('drain')
             // per backpressured chunk would pile up listeners until Node warns.
@@ -651,15 +692,25 @@ export async function startGateway(
         });
         request.once('end', () => {
           requestBodyComplete = true;
-          if (!bodyTooLarge && !clientDisconnected && !upstreamTimedOut && !upstreamSettled) {
-            upstreamRequest.end();
-            if (pendingUpstreamResponse !== undefined) {
-              const upstreamResponse = pendingUpstreamResponse;
-              pendingUpstreamResponse = undefined;
-              forwardUpstreamResponse(upstreamResponse);
-              upstreamResponse.resume();
-            }
+          if (bodyTooLarge || clientDisconnected || upstreamTimedOut) {
+            return;
           }
+          if (pendingUpstreamResponse !== undefined) {
+            // The upstream answered before the body completed, and the body stayed
+            // within the limit: forward the held response now.
+            const upstreamResponse = pendingUpstreamResponse;
+            pendingUpstreamResponse = undefined;
+            forwardUpstreamResponse(upstreamResponse);
+            upstreamResponse.resume();
+            return;
+          }
+          if (deferredFailure) {
+            clearTimeout(timeout);
+            upstreamSettled = true;
+            rejectJson(request, response, 503, { error: 'backend unavailable' });
+            return;
+          }
+          upstreamRequest.end();
         });
         request.once('error', abortUpstream);
       })().catch((error: unknown) => {
