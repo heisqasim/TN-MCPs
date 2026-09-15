@@ -197,6 +197,9 @@ importers:
       '@modelcontextprotocol/client':
         specifier: 2.0.0
         version: 2.0.0
+      '@tn-mcps/mcp-cloudflare':
+        specifier: workspace:*
+        version: link:../mcps/cloudflare
       '@tn-mcps/mcp-common':
         specifier: workspace:*
         version: link:../packages/mcp-common

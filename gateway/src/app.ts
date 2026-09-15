@@ -10,6 +10,7 @@ import {
 
 import {
   ACCESS_ASSERTION_HEADER,
+  type Authenticator,
   createAuthenticator,
   DEV_ASSERTION_HEADER,
   type Principal,
@@ -26,7 +27,7 @@ import {
   SHUTDOWN_DRAIN_MS,
 } from '@tn-mcps/config';
 import { acceptOrCreateRequestId, createLogger, REQUEST_ID_HEADER } from '@tn-mcps/observability';
-import { createHttpLifecycle } from '@tn-mcps/shared';
+import { createHttpLifecycle, redact } from '@tn-mcps/shared';
 
 type BackendProcessName = Exclude<ProcessName, 'gateway'>;
 
@@ -45,6 +46,17 @@ export interface StartGatewayOptions {
 export interface RunningGateway {
   url: string;
   close(): Promise<void>;
+}
+
+interface GatewayLogger {
+  info(bindings: Record<string, unknown>, message: string): void;
+  error(bindings: Record<string, unknown>, message: string): void;
+}
+
+/** @internal Dependency seam for request-pipeline fault tests. */
+export interface StartGatewayDependencies {
+  authenticator?: Authenticator;
+  logger?: GatewayLogger;
 }
 
 interface RateLimitDecision {
@@ -293,16 +305,19 @@ function formatListenUrl(host: string, port: number): string {
   return `http://${urlHost}:${port}`;
 }
 
-export async function startGateway(options: StartGatewayOptions = {}): Promise<RunningGateway> {
+export async function startGateway(
+  options: StartGatewayOptions = {},
+  dependencies: StartGatewayDependencies = {},
+): Promise<RunningGateway> {
   const config = loadProcessConfig('gateway', options.env);
-  const authenticator = createAuthenticator(config, 'gateway');
+  const authenticator = dependencies.authenticator ?? createAuthenticator(config, 'gateway');
   const targets = buildRouteTargets(options.routeTargets);
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? REQUEST_TIMEOUT_MS;
   if (!Number.isFinite(upstreamTimeoutMs) || upstreamTimeoutMs <= 0) {
     throw new RangeError('upstreamTimeoutMs must be a positive finite number');
   }
 
-  const logger = createLogger({ name: 'gateway', level: config.logLevel });
+  const logger = dependencies.logger ?? createLogger({ name: 'gateway', level: config.logLevel });
   const takeRateLimitToken = createRateLimiter(config.rateLimitPerMinute);
   let activeListenPort = options.listenPortOverride ?? config.port;
   let hosts = allowedHostnames(config.publicBaseUrl);
@@ -535,7 +550,8 @@ export async function startGateway(options: StartGatewayOptions = {}): Promise<R
         }
       });
       request.once('error', abortUpstream);
-    })().catch(() => {
+    })().catch((error: unknown) => {
+      logger.error({ error: redact(error), requestId }, 'unexpected request pipeline error');
       if (response.headersSent) {
         response.destroy();
       } else {

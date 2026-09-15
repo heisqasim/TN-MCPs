@@ -460,6 +460,58 @@ describe('gateway streaming and cancellation', () => {
     await rm(directory, { recursive: true });
   });
 
+  it('logs a redacted request ID when the request pipeline throws', async () => {
+    const errors: Array<{ bindings: Record<string, unknown>; message: string }> = [];
+    const gateway = await startGateway(
+      {
+        env: environment(tokenFile),
+        listenPortOverride: 0,
+      },
+      {
+        authenticator: {
+          async authenticate() {
+            throw new Error('Authorization: Bearer must-not-reach-the-log');
+          },
+        },
+        logger: {
+          info() {},
+          error(bindings, message) {
+            errors.push({ bindings, message });
+          },
+        },
+      },
+    );
+
+    try {
+      const body = '{}';
+      const response = await request(new URL('/cloudflare/mcp', gateway.url), {
+        method: 'POST',
+        headers: {
+          ...authenticatedHeaders(body),
+          'x-request-id': 'pipeline.failure-test',
+        },
+        chunks: [body],
+      });
+
+      expect(response.status).toBe(500);
+      expect(JSON.parse(response.body)).toEqual({ error: 'internal server error' });
+      expect(errors).toEqual([
+        {
+          bindings: {
+            error: {
+              name: 'Error',
+              message: 'Authorization: Bearer [REDACTED]',
+            },
+            requestId: 'pipeline.failure-test',
+          },
+          message: 'unexpected request pipeline error',
+        },
+      ]);
+    } finally {
+      await gateway.close();
+    }
+  });
+
   it('delivers the first SSE event before the backend sends the second', async () => {
     let secondSentAt = Number.POSITIVE_INFINITY;
     const backend = createServer((_incoming, response) => {
