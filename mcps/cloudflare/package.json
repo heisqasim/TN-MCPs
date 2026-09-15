@@ -18,7 +18,8 @@
     "start": "node dist/main.js"
   },
   "dependencies": {
-    "@tn-mcps/mcp-common": "workspace:*"
+    "@tn-mcps/mcp-common": "workspace:*",
+    "@tn-mcps/shared": "workspace:*"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.0.0"

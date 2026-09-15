@@ -1,5 +1,7 @@
 import { closeSync, constants, fstatSync, openSync, readSync, type Stats } from 'node:fs';
 
+import { registerSecretValue } from './known-secrets.js';
+
 const MAX_SECRET_FILE_BYTES = 65_536;
 const SYMLINK_OPEN_ERROR_CODES = new Set(['ELOOP', 'EMLINK', 'EFTYPE']);
 
@@ -137,6 +139,7 @@ export function readSecretFile(path: string, opts: ReadSecretFileOptions): strin
     if (trimmed.length === 0) {
       throw new SecretFileError(opts.variable, path, `file is empty: ${path}`);
     }
+    registerSecretValue(trimmed);
     return trimmed;
   } finally {
     closeSync(descriptor);

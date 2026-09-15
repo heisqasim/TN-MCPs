@@ -209,6 +209,9 @@ importers:
       '@tn-mcps/mcp-common':
         specifier: workspace:*
         version: link:../../packages/mcp-common
+      '@tn-mcps/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
     devDependencies:
       '@modelcontextprotocol/client':
         specifier: 2.0.0

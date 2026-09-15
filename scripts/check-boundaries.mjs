@@ -1,3 +1,9 @@
+// Architecture boundary gate for the Telos Nexus MCP control plane (MASTER_PLAN §A.3).
+//
+// The pattern scan is a supplementary gate: it greps sources for known escape hatches so
+// a regression fails CI even before any code runs. The structural B1 enforcement is
+// pnpm's strict node_modules — an undeclared package cannot be resolved — which makes
+// the package.json dependency check below the authoritative part of B1.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
@@ -103,6 +109,18 @@ function isRestrictedModule(specifier) {
   return RESTRICTED_MODULE.test(specifier) && !specifier.includes('${');
 }
 
+// An npm alias dependency ("name": "npm:@modelcontextprotocol/server@2.0.0") smuggles a
+// restricted module in under an innocent key, so aliases must resolve to their target.
+function aliasedNpmModule(value) {
+  if (typeof value !== 'string' || !value.startsWith('npm:')) {
+    return undefined;
+  }
+  const spec = value.slice('npm:'.length);
+  const versionSeparator = spec.lastIndexOf('@');
+  const moduleName = versionSeparator > 0 ? spec.slice(0, versionSeparator) : spec;
+  return isRestrictedModule(moduleName) ? moduleName : undefined;
+}
+
 function addImportFindings(content, path, findings) {
   const importPatterns = [
     /\bimport\s+(?:(?:[\s\S]*?)\sfrom\s+)?(['"`])([^'"`]*?)\1/g,
@@ -122,10 +140,15 @@ function addImportFindings(content, path, findings) {
 
 function addRegistrationFindings(content, path, findings) {
   const withoutComments = stripComments(content);
-  const registrationPattern = /\bregister(Tool|Resource|Prompt)\s*\(/g;
+  const registrationPatterns = [
+    [/\bregister(?:Tool|Resource|Prompt)\s*\(/g, 'B2-registration-call'],
+    [/\bset(?:Request|Notification)Handler\s*\(/g, 'B2-low-level-handler-call'],
+  ];
 
-  for (const match of withoutComments.matchAll(registrationPattern)) {
-    addFinding(findings, path, lineNumberAt(withoutComments, match.index), 'B2-registration-call');
+  for (const [pattern, rule] of registrationPatterns) {
+    for (const match of withoutComments.matchAll(pattern)) {
+      addFinding(findings, path, lineNumberAt(withoutComments, match.index), rule);
+    }
   }
 }
 
@@ -139,8 +162,8 @@ function addDependencyFindings(content, path, findings) {
       continue;
     }
 
-    for (const dependency of Object.keys(dependencies)) {
-      if (isRestrictedModule(dependency)) {
+    for (const [dependency, target] of Object.entries(dependencies)) {
+      if (isRestrictedModule(dependency) || aliasedNpmModule(target) !== undefined) {
         addFinding(
           findings,
           path,

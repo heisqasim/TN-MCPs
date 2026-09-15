@@ -1,5 +1,6 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, request as httpRequest, type IncomingMessage, type Server } from 'node:http';
+import { type AddressInfo, connect as connectTcp } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
@@ -7,7 +8,7 @@ import { Writable } from 'node:stream';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { DEV_ASSERTION_HEADER } from '@tn-mcps/auth';
-import { MAX_BODY_BYTES } from '@tn-mcps/config';
+import { EDGE_HEADERS, MAX_BODY_BYTES } from '@tn-mcps/config';
 import { createLogger } from '@tn-mcps/observability';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
@@ -125,6 +126,132 @@ function requestWithoutFinishingBody(url: URL): Promise<HttpResponse> {
       }
     });
     outgoing.write('{');
+  });
+}
+
+interface RawResult {
+  response: {
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+  };
+  /** Milliseconds between a complete response and the socket closing; null when it never closed. */
+  closed: Promise<number | null>;
+}
+
+// Drives one HTTP/1.1 POST over a raw socket so tests can keep the request body open
+// while the server responds, and can observe who closes the connection and when.
+function rawPost(options: {
+  port: number;
+  path: string;
+  hostHeader?: string;
+  headers?: Record<string, string>;
+  body: string;
+  finishBody?: boolean;
+}): Promise<RawResult> {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    let respondedAt: number | undefined;
+    let settled = false;
+    let socket: ReturnType<typeof connectTcp> | undefined;
+
+    const complete = (head: string, body: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(guard);
+      const headers = Object.fromEntries(
+        head
+          .split('\r\n')
+          .slice(1)
+          .filter((line) => line.includes(':'))
+          .map((line) => {
+            const separator = line.indexOf(':');
+            return [
+              line.slice(0, separator).trim().toLowerCase(),
+              line.slice(separator + 1).trim(),
+            ] as const;
+          }),
+      );
+      const timing = () => (respondedAt === undefined ? null : performance.now() - respondedAt);
+      resolve({
+        response: {
+          status: Number(head.split(' ')[1] ?? 0),
+          headers,
+          body,
+        },
+        closed:
+          socket === undefined || socket.destroyed || socket.readableEnded
+            ? Promise.resolve(timing())
+            : new Promise((resolveClose) => {
+                socket?.once('close', () => resolveClose(timing()));
+              }),
+      });
+    };
+
+    const guard = setTimeout(() => {
+      socket?.destroy();
+      reject(new Error('raw request never received a complete response'));
+    }, 3_000);
+    guard.unref();
+
+    socket = connectTcp({ host: '127.0.0.1', port: options.port }, () => {
+      const headerLines = [
+        `Host: ${options.hostHeader ?? '127.0.0.1'}`,
+        'Content-Type: application/json',
+        'Accept: application/json, text/event-stream',
+        ...Object.entries(options.headers ?? {}).map(([name, value]) => `${name}: ${value}`),
+        `Content-Length: ${Buffer.byteLength(options.body)}`,
+        'Connection: keep-alive',
+      ];
+      socket?.write(`POST ${options.path} HTTP/1.1\r\n${headerLines.join('\r\n')}\r\n\r\n`);
+      socket?.write(options.body);
+      if (options.finishBody !== false) {
+        socket?.end();
+      }
+    });
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string) => {
+      raw += chunk;
+      if (respondedAt !== undefined) {
+        return;
+      }
+      const separator = raw.indexOf('\r\n\r\n');
+      if (separator === -1) {
+        return;
+      }
+      const head = raw.slice(0, separator);
+      const body = raw.slice(separator + 4);
+      const contentLength = Number(
+        Object.fromEntries(
+          head
+            .split('\r\n')
+            .slice(1)
+            .filter((line) => line.toLowerCase().startsWith('content-length:'))
+            .map((line) => ['content-length', line.slice(line.indexOf(':') + 1).trim()] as const),
+        ).contentLength ?? '0',
+      );
+      if (Buffer.byteLength(body) < contentLength) {
+        return;
+      }
+      respondedAt = performance.now();
+      complete(head, body);
+    });
+    socket.once('close', () => {
+      if (settled) {
+        return;
+      }
+      const separator = raw.indexOf('\r\n\r\n');
+      respondedAt = performance.now();
+      complete(raw.slice(0, separator), raw.slice(separator + 4));
+    });
+    socket.on('error', (error: Error) => {
+      if (respondedAt === undefined && !settled) {
+        clearTimeout(guard);
+        reject(error);
+      }
+    });
   });
 }
 
@@ -271,6 +398,16 @@ describe('MCP backend over real HTTP', () => {
     expect(response.status).toBe(403);
   });
 
+  it.each(EDGE_HEADERS)('refuses %s in dev auth mode', async (header) => {
+    const response = await request(new URL(backend.url), {
+      method: 'POST',
+      headers: { ...mcpHeaders(), [header]: 'edge-value' },
+      chunks: ['{}'],
+    });
+    expect(response.status).toBe(403);
+    expect(response.headers.connection).toBe('close');
+  });
+
   it('rejects every Origin header', async () => {
     const response = await request(new URL(backend.url), {
       method: 'POST',
@@ -302,11 +439,29 @@ describe('MCP backend over real HTTP', () => {
     });
     expect(response.status).toBe(400);
     expect(response.headers['content-type']).toBe('application/json');
+    expect(response.headers.connection).toBe('close');
     expect(JSON.parse(response.body)).toEqual({
       jsonrpc: '2.0',
       id: null,
       error: { code: -32700, message: 'Parse error' },
     });
+  });
+
+  it('closes the socket of a keep-alive request rejected while its body is open', async () => {
+    const port = Number(new URL(backend.url).port);
+    const result = await rawPost({
+      port,
+      path: '/mcp',
+      hostHeader: 'evil.example',
+      body: '{"partial":',
+      finishBody: false,
+    });
+
+    expect(result.response.status).toBe(403);
+    expect(result.response.headers.connection).toBe('close');
+    const closedAfterMs = await result.closed;
+    expect(closedAfterMs).not.toBeNull();
+    expect(closedAfterMs).toBeLessThan(2_000);
   });
 
   it('returns 404 for unknown routes', async () => {
@@ -419,6 +574,41 @@ describe('policy wrapper over the SDK server', () => {
     }),
     defineTool({
       ...common,
+      name: 'test_secret_echo',
+      risk: 'R0',
+      scopes: ['tn:read'],
+      approval: 'never',
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      async handler() {
+        return {
+          content: [{ type: 'text', text: `nested ${developmentCredential} tail` }],
+          structuredContent: { deep: { value: developmentCredential }, kept: 42 },
+        };
+      },
+    }),
+    defineTool({
+      ...common,
+      name: 'test_secret_throw',
+      risk: 'R0',
+      scopes: ['tn:read'],
+      approval: 'never',
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      async handler() {
+        throw new Error(`upstream rejected ${developmentCredential}`);
+      },
+    }),
+    defineTool({
+      ...common,
       name: 'test_context_boundary',
       risk: 'R0',
       scopes: ['tn:read'],
@@ -516,6 +706,24 @@ describe('policy wrapper over the SDK server', () => {
     });
     expect(JSON.stringify(result)).not.toContain(developmentCredential);
   });
+
+  it('scrubs the loaded dev token from tool text and structured content', async () => {
+    const result = await client.callTool({ name: 'test_secret_echo', arguments: {} });
+    expect(result.isError).not.toBe(true);
+    expect(textOf(result)).toBe('nested [REDACTED] tail');
+    expect(result.structuredContent).toEqual({ deep: { value: '[REDACTED]' }, kept: 42 });
+    expect(JSON.stringify(result)).not.toContain(developmentCredential);
+  });
+
+  it('scrubs the loaded dev token from a thrown handler error and from the log', async () => {
+    const linesBefore = logLines.length;
+    const result = await client.callTool({ name: 'test_secret_throw', arguments: {} });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toBe('upstream rejected [REDACTED]');
+
+    const newLines = logLines.slice(linesBefore).join('');
+    expect(newLines).not.toContain(developmentCredential);
+  });
 });
 
 describe('principal kind validation through the SDK', () => {
@@ -553,6 +761,86 @@ describe('principal kind validation through the SDK', () => {
         server.close((error) => (error === undefined ? resolve() : reject(error)));
       });
       await mcp.close();
+    }
+  });
+});
+
+describe('backend startup and shutdown robustness', () => {
+  let tokenDirectory: string;
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    const token = await makeTokenFile();
+    tokenDirectory = token.directory;
+    tokenFile = token.path;
+  });
+
+  afterAll(async () => {
+    await rm(tokenDirectory, { recursive: true });
+  });
+
+  const productionEnvironment = {
+    NODE_ENV: 'production',
+    TN_AUTH_MODE: 'access',
+    TN_LOG_LEVEL: 'silent',
+  } as const;
+
+  it('refuses the listenPortOverride in production', async () => {
+    await expect(
+      startMcpBackend({
+        processName: 'cloudflare',
+        version,
+        env: productionEnvironment,
+        listenPortOverride: 0,
+        logger,
+      }),
+    ).rejects.toThrow(/listenPortOverride is test-only/);
+  });
+
+  it('refuses the headersTimeoutMs override in production', async () => {
+    await expect(
+      startMcpBackend({
+        processName: 'cloudflare',
+        version,
+        env: productionEnvironment,
+        headersTimeoutMs: 250,
+        logger,
+      }),
+    ).rejects.toThrow(/headersTimeoutMs is test-only/);
+  });
+
+  it('removes signal handlers and closes the MCP handler when the listen port is taken', async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(0, '127.0.0.1', () => {
+        blocker.off('error', reject);
+        resolve();
+      });
+    });
+    const port = (blocker.address() as AddressInfo).port;
+    const sigtermBefore = process.listenerCount('SIGTERM');
+    const sigintBefore = process.listenerCount('SIGINT');
+
+    try {
+      await expect(
+        startMcpBackend({
+          processName: 'cloudflare',
+          version,
+          env: environment(tokenFile),
+          listenPortOverride: port,
+          installSignalHandlers: true,
+          logger,
+        }),
+      ).rejects.toMatchObject({ code: 'EADDRINUSE' });
+
+      expect(process.listenerCount('SIGTERM')).toBe(sigtermBefore);
+      expect(process.listenerCount('SIGINT')).toBe(sigintBefore);
+    } finally {
+      blocker.closeAllConnections();
+      await new Promise<void>((resolve) => {
+        blocker.close(() => resolve());
+      });
     }
   });
 });

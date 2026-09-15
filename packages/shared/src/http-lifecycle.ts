@@ -1,5 +1,7 @@
 import type { Server } from 'node:http';
 
+import { redact } from './redact.js';
+
 export interface HttpLifecycleOptions {
   drainMs: number;
 }
@@ -53,7 +55,10 @@ export function createHttpLifecycle(server: Server, options: HttpLifecycleOption
 
   function installSignalHandlers(): void {
     const handleSignal = () => {
-      void shutdown();
+      void shutdown().catch((error: unknown) => {
+        console.error(JSON.stringify({ error: redact(error) }));
+        process.exitCode = 1;
+      });
     };
     process.once('SIGTERM', handleSignal);
     process.once('SIGINT', handleSignal);

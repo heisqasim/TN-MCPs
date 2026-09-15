@@ -4,6 +4,7 @@ export {
   type HttpLifecycle,
   type HttpLifecycleOptions,
 } from './http-lifecycle.js';
+export { registerSecretValue, scrubKnownSecrets } from './known-secrets.js';
 export {
   type RedactOptions,
   redact,
@@ -15,3 +16,4 @@ export {
   readSecretFile,
   SecretFileError,
 } from './secret-file.js';
+export { formatStartupError } from './startup-error.js';

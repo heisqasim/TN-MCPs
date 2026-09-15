@@ -1,3 +1,4 @@
+import { registerSecretValue } from '@tn-mcps/shared';
 import { describe, expect, it } from 'vitest';
 
 import { acceptOrCreateRequestId, createLogger, newRequestId } from '../src/index.js';
@@ -69,6 +70,23 @@ describe('createLogger', () => {
 
     const record = JSON.parse(capture.lines[0] ?? '{}') as Record<string, unknown>;
     expect(record.authorization).toBe('[REDACTED]');
+  });
+
+  it('scrubs values registered in the known-secret registry', () => {
+    const capture = captureDestination();
+    const secret = 'observability-registered-value';
+    registerSecretValue(secret);
+    const logger = createLogger({
+      name: 'test',
+      level: 'info',
+      destination: capture.destination,
+    });
+
+    logger.info({ detail: `loaded ${secret}` }, `message ${secret}`);
+
+    const record = JSON.parse(capture.lines[0] ?? '{}') as Record<string, unknown>;
+    expect(record).toMatchObject({ detail: 'loaded [REDACTED]', msg: 'message [REDACTED]' });
+    expect(capture.lines[0]).not.toContain(secret);
   });
 });
 

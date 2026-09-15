@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { scrubKnownSecrets } from '../src/known-secrets.js';
 import { readSecretFile, SecretFileError } from '../src/secret-file.js';
 
 const temporaryDirectories: string[] = [];
@@ -58,6 +59,13 @@ describe('readSecretFile', () => {
     const expected = 'content-from-the-open-file';
 
     expect(read(fixture(expected, 0o600))).toBe(expected);
+  });
+
+  it('registers every value it returns in the known-secret registry', () => {
+    const expected = 'read-then-scrubbed-value';
+
+    expect(read(fixture(expected, 0o600))).toBe(expected);
+    expect(scrubKnownSecrets(`output ${expected} tail`)).toBe('output [REDACTED] tail');
   });
 
   it('allows mode 0640 only for the matching group', () => {

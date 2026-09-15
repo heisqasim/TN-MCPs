@@ -1,6 +1,6 @@
 import type { McpServer, ServerContext } from '@modelcontextprotocol/server';
 import type { Principal } from '@tn-mcps/auth';
-import { redact } from '@tn-mcps/shared';
+import { redact, scrubKnownSecrets } from '@tn-mcps/shared';
 
 import type { Logger, ToolContext, ToolResult } from './contract.js';
 import type { ToolRegistry } from './registry.js';
@@ -16,9 +16,28 @@ export interface PolicyContextBase {
 
 function errorResult(message: string): ToolResult {
   return {
-    content: [{ type: 'text', text: message }],
+    content: [{ type: 'text', text: scrubKnownSecrets(message) }],
     isError: true,
   };
+}
+
+function scrubStringLeaves(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return scrubKnownSecrets(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(scrubStringLeaves);
+  }
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, scrubStringLeaves(item)]),
+    );
+  }
+  return value;
+}
+
+function scrubToolResult(result: ToolResult): ToolResult {
+  return scrubStringLeaves(result) as ToolResult;
 }
 
 function principalFromContext(context: ServerContext): Principal | undefined {
@@ -86,7 +105,7 @@ export function registerWithPolicy(
         };
 
         try {
-          const result = await definition.handler(args, toolContext);
+          const result = scrubToolResult(await definition.handler(args, toolContext));
           if (Buffer.byteLength(JSON.stringify(result), 'utf8') > RESULT_SIZE_CAP_BYTES) {
             return errorResult('result exceeded the 48 KiB cap');
           }

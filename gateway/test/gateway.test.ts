@@ -5,11 +5,12 @@ import {
   type IncomingHttpHeaders,
   type Server,
 } from 'node:http';
+import { type AddressInfo, connect as connectTcp } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { MAX_BODY_BYTES } from '@tn-mcps/config';
+import { EDGE_HEADERS, MAX_BODY_BYTES } from '@tn-mcps/config';
 import { type RunningMcpBackend, startMcpBackend } from '@tn-mcps/mcp-common';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -205,7 +206,7 @@ describe('gateway request pipeline and header boundary', () => {
     gateway = await startGateway({
       env: environment(tokenFile),
       listenPortOverride: 0,
-      routeTargets: { cloudflare: echoUrl },
+      routeTargets: { cloudflare: `${echoUrl}/mcp` },
     });
   });
 
@@ -225,7 +226,7 @@ describe('gateway request pipeline and header boundary', () => {
         origin: gateway.url,
         'x-request-id': 'gateway.header-test',
         'x-tn-dev-assertion': 'client-supplied-dev-value',
-        'cf-access-jwt-assertion': 'client-supplied-access-value',
+        'cf-worker': 'client-supplied-worker-value',
         'mcp-method': 'tools/call',
         'mcp-param-example': 'allowed',
         'x-private-client': 'must-not-pass',
@@ -247,7 +248,7 @@ describe('gateway request pipeline and header boundary', () => {
     expect(forwarded?.authorization).toBeUndefined();
     expect(forwarded?.cookie).toBeUndefined();
     expect(forwarded?.origin).toBeUndefined();
-    expect(forwarded?.['cf-access-jwt-assertion']).toBeUndefined();
+    expect(forwarded?.['cf-worker']).toBeUndefined();
     expect(forwarded?.['x-private-client']).toBeUndefined();
   });
 
@@ -279,8 +280,105 @@ describe('gateway request pipeline and header boundary', () => {
       chunks: ['{}'],
     });
     expect(hostileHost.status).toBe(403);
+    expect(hostileHost.headers.connection).toBe('close');
     expect(hostileOrigin.status).toBe(403);
     expect(receivedHeaders).toHaveLength(hitsBefore);
+  });
+
+  it.each(EDGE_HEADERS)(
+    'refuses %s at the gateway in dev auth mode before proxying',
+    async (header) => {
+      const hitsBefore = receivedHeaders.length;
+      const response = await request(new URL('/cloudflare/mcp', gateway.url), {
+        method: 'POST',
+        headers: { ...authenticatedHeaders('{}'), [header]: 'edge-value' },
+        chunks: ['{}'],
+      });
+      expect(response.status).toBe(403);
+      expect(response.headers.connection).toBe('close');
+      expect(receivedHeaders).toHaveLength(hitsBefore);
+    },
+  );
+
+  it('warns (redacted) when edge headers are refused in dev mode', async () => {
+    const warnings: Array<{ bindings: Record<string, unknown>; message: string }> = [];
+    const warnedGateway = await startGateway(
+      {
+        env: environment(tokenFile),
+        listenPortOverride: 0,
+        routeTargets: { cloudflare: `${echoUrl}/mcp` },
+      },
+      {
+        logger: {
+          info() {},
+          warn(bindings, message) {
+            warnings.push({ bindings, message });
+          },
+          error() {},
+        },
+      },
+    );
+    try {
+      const response = await request(new URL('/cloudflare/mcp', warnedGateway.url), {
+        method: 'POST',
+        headers: {
+          ...authenticatedHeaders('{}'),
+          'cf-connecting-ip': '203.0.113.9',
+          'x-forwarded-for': '203.0.113.9',
+        },
+        chunks: ['{}'],
+      });
+      expect(response.status).toBe(403);
+      expect(warnings).toEqual([
+        {
+          bindings: {
+            edgeHeaders: ['cf-connecting-ip', 'x-forwarded-for'],
+            requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          },
+          message: 'edge headers rejected in dev auth mode',
+        },
+      ]);
+    } finally {
+      await warnedGateway.close();
+    }
+  });
+
+  it('allows edge headers in access mode, where the edge is expected', async () => {
+    const accessGateway = await startGateway(
+      {
+        env: environment(tokenFile, { TN_AUTH_MODE: 'access' }),
+        listenPortOverride: 0,
+        routeTargets: { cloudflare: `${echoUrl}/mcp` },
+      },
+      {
+        authenticator: {
+          async authenticate() {
+            return {
+              ok: true,
+              principal: { kind: 'service', id: 'access-test-principal', scopes: ['tn:read'] },
+            };
+          },
+        },
+      },
+    );
+    try {
+      const response = await request(new URL('/cloudflare/mcp', accessGateway.url), {
+        method: 'POST',
+        headers: {
+          ...authenticatedHeaders('{}'),
+          origin: accessGateway.url,
+          'cf-access-jwt-assertion': 'access-assertion-value',
+          'cf-ray': 'edge-ray-value',
+        },
+        chunks: ['{}'],
+      });
+      expect(response.status).toBe(200);
+      const forwarded = receivedHeaders.at(-1);
+      expect(forwarded?.['cf-ray']).toBeUndefined();
+      expect(forwarded?.['cf-access-jwt-assertion']).toBe('access-assertion-value');
+    } finally {
+      await accessGateway.close();
+    }
   });
 
   it('allows an absent Origin for a non-browser client', async () => {
@@ -377,7 +475,7 @@ describe('gateway limits and upstream failure mapping', () => {
     const gateway = await startGateway({
       env: environment(tokenFile, { TN_RATE_LIMIT_PER_MINUTE: '1' }),
       listenPortOverride: 0,
-      routeTargets: { cloudflare: backendUrl },
+      routeTargets: { cloudflare: `${backendUrl}/mcp` },
     });
     try {
       const first = await request(new URL('/cloudflare/mcp', gateway.url), {
@@ -406,7 +504,7 @@ describe('gateway limits and upstream failure mapping', () => {
     const gateway = await startGateway({
       env: environment(tokenFile),
       listenPortOverride: 0,
-      routeTargets: { cloudflare: unavailableUrl },
+      routeTargets: { cloudflare: `${unavailableUrl}/mcp` },
     });
     try {
       const response = await request(new URL('/cloudflare/mcp', gateway.url), {
@@ -428,7 +526,7 @@ describe('gateway limits and upstream failure mapping', () => {
     const gateway = await startGateway({
       env: environment(tokenFile),
       listenPortOverride: 0,
-      routeTargets: { cloudflare: backendUrl },
+      routeTargets: { cloudflare: `${backendUrl}/mcp` },
       upstreamTimeoutMs: 200,
     });
     try {
@@ -475,6 +573,7 @@ describe('gateway streaming and cancellation', () => {
         },
         logger: {
           info() {},
+          warn() {},
           error(bindings, message) {
             errors.push({ bindings, message });
           },
@@ -526,7 +625,7 @@ describe('gateway streaming and cancellation', () => {
     const gateway = await startGateway({
       env: environment(tokenFile),
       listenPortOverride: 0,
-      routeTargets: { cloudflare: backendUrl },
+      routeTargets: { cloudflare: `${backendUrl}/mcp` },
     });
 
     try {
@@ -593,7 +692,7 @@ describe('gateway streaming and cancellation', () => {
     const gateway = await startGateway({
       env: environment(tokenFile),
       listenPortOverride: 0,
-      routeTargets: { cloudflare: backendUrl },
+      routeTargets: { cloudflare: `${backendUrl}/mcp` },
     });
 
     try {
@@ -611,5 +710,327 @@ describe('gateway streaming and cancellation', () => {
       await gateway.close();
       await closeServer(backend);
     }
+  });
+});
+
+interface RawResult {
+  response: {
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+  };
+  /** Milliseconds between a complete response and the socket closing; null when it never closed. */
+  closed: Promise<number | null>;
+}
+
+// Drives one HTTP/1.1 POST over a raw socket so tests can keep the request body open
+// while the server responds, and can observe who closes the connection and when.
+function rawPost(options: {
+  port: number;
+  path: string;
+  headers?: Record<string, string>;
+  body: string;
+  finishBody?: boolean;
+}): Promise<RawResult> {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    let respondedAt: number | undefined;
+    let settled = false;
+    let socket: ReturnType<typeof connectTcp> | undefined;
+
+    const complete = (head: string, body: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(guard);
+      const headers = Object.fromEntries(
+        head
+          .split('\r\n')
+          .slice(1)
+          .filter((line) => line.includes(':'))
+          .map((line) => {
+            const separator = line.indexOf(':');
+            return [
+              line.slice(0, separator).trim().toLowerCase(),
+              line.slice(separator + 1).trim(),
+            ] as const;
+          }),
+      );
+      const timing = () => (respondedAt === undefined ? null : performance.now() - respondedAt);
+      resolve({
+        response: {
+          status: Number(head.split(' ')[1] ?? 0),
+          headers,
+          body,
+        },
+        closed:
+          socket === undefined || socket.destroyed || socket.readableEnded
+            ? Promise.resolve(timing())
+            : new Promise((resolveClose) => {
+                socket?.once('close', () => resolveClose(timing()));
+              }),
+      });
+    };
+
+    const guard = setTimeout(() => {
+      socket?.destroy();
+      reject(new Error('raw request never received a complete response'));
+    }, 3_000);
+    guard.unref();
+
+    socket = connectTcp({ host: '127.0.0.1', port: options.port }, () => {
+      const headerLines = [
+        `Host: ${options.headers?.host ?? '127.0.0.1'}`,
+        ...Object.entries(options.headers ?? {})
+          .filter(([name]) => name.toLowerCase() !== 'host')
+          .map(([name, value]) => `${name}: ${value}`),
+        `Content-Length: ${Buffer.byteLength(options.body)}`,
+        'Connection: keep-alive',
+      ];
+      socket?.write(`POST ${options.path} HTTP/1.1\r\n${headerLines.join('\r\n')}\r\n\r\n`);
+      socket?.write(options.body);
+      if (options.finishBody !== false) {
+        socket?.end();
+      }
+    });
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string) => {
+      raw += chunk;
+      if (respondedAt !== undefined) {
+        return;
+      }
+      const separator = raw.indexOf('\r\n\r\n');
+      if (separator === -1) {
+        return;
+      }
+      const head = raw.slice(0, separator);
+      const body = raw.slice(separator + 4);
+      const contentLength = Number(
+        Object.fromEntries(
+          head
+            .split('\r\n')
+            .slice(1)
+            .filter((line) => line.toLowerCase().startsWith('content-length:'))
+            .map((line) => ['content-length', line.slice(line.indexOf(':') + 1).trim()] as const),
+        ).contentLength ?? '0',
+      );
+      if (Buffer.byteLength(body) < contentLength) {
+        return;
+      }
+      respondedAt = performance.now();
+      complete(head, body);
+    });
+    socket.once('close', () => {
+      if (settled) {
+        return;
+      }
+      const separator = raw.indexOf('\r\n\r\n');
+      respondedAt = performance.now();
+      complete(raw.slice(0, separator), raw.slice(separator + 4));
+    });
+    socket.on('error', (error: Error) => {
+      if (respondedAt === undefined && !settled) {
+        clearTimeout(guard);
+        reject(error);
+      }
+    });
+  });
+}
+
+describe('gateway connections, overrides, and shutdown', () => {
+  let directory: string;
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'tn-gateway-hardening-'));
+    tokenFile = join(directory, 'dev-token');
+    await writeFile(tokenFile, developmentCredential, { mode: 0o600 });
+  });
+
+  afterAll(async () => {
+    await rm(directory, { recursive: true });
+  });
+
+  it('closes the socket of a keep-alive request to an unknown route', async () => {
+    const gateway = await startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+    });
+    try {
+      const port = Number(new URL(gateway.url).port);
+      const result = await rawPost({ port, path: '/nope', body: '{}', finishBody: false });
+
+      expect(result.response.status).toBe(404);
+      expect(result.response.headers.connection).toBe('close');
+      const closedAfterMs = await result.closed;
+      expect(closedAfterMs).not.toBeNull();
+      expect(closedAfterMs).toBeLessThan(2_000);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it('disconnects a client that never finishes its headers after headersTimeout', async () => {
+    const headersTimeoutMs = 250;
+    const gateway = await startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      headersTimeoutMs,
+    });
+    try {
+      const port = Number(new URL(gateway.url).port);
+      const closedAt = new Promise<number>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error('slow-headers socket never closed')),
+          2_000,
+        );
+        timeout.unref();
+        const socket = connectTcp({ host: '127.0.0.1', port }, () => {
+          socket.write('POST /cloudflare/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n');
+        });
+        // The client must consume the socket: a peer FIN hides behind unread
+        // buffered data and would otherwise never surface as 'close'.
+        socket.on('data', (_chunk: Buffer) => socket.resume());
+        socket.once('error', (error: Error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+        socket.once('close', () => {
+          clearTimeout(timeout);
+          resolve(performance.now());
+        });
+      });
+
+      const openedAt = performance.now();
+      await expect(closedAt).resolves.toBeGreaterThan(openedAt);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it('removes signal handlers when the listen port is taken', async () => {
+    const blocker = createServer();
+    await listen(blocker);
+    const port = (blocker.address() as AddressInfo).port;
+    const sigtermBefore = process.listenerCount('SIGTERM');
+    const sigintBefore = process.listenerCount('SIGINT');
+
+    try {
+      await expect(
+        startGateway({
+          env: environment(tokenFile),
+          listenPortOverride: port,
+          installSignalHandlers: true,
+        }),
+      ).rejects.toMatchObject({ code: 'EADDRINUSE' });
+
+      expect(process.listenerCount('SIGTERM')).toBe(sigtermBefore);
+      expect(process.listenerCount('SIGINT')).toBe(sigintBefore);
+    } finally {
+      await closeServer(blocker);
+    }
+  });
+
+  it('shuts down on SIGTERM without touching the process exit code', async () => {
+    const sigtermBefore = process.listenerCount('SIGTERM');
+    const sigintBefore = process.listenerCount('SIGINT');
+    const gateway = await startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      installSignalHandlers: true,
+    });
+    try {
+      process.emit('SIGTERM');
+      await gateway.close();
+
+      expect(process.exitCode ?? 0).toBe(0);
+    } finally {
+      expect(process.listenerCount('SIGTERM')).toBe(sigtermBefore);
+      expect(process.listenerCount('SIGINT')).toBe(sigintBefore);
+    }
+  });
+
+  it('accepts an exact loopback /mcp route target', async () => {
+    const echoBackend = createServer((_incoming, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{"proxied":true}');
+    });
+    const echoUrl = await listen(echoBackend);
+    try {
+      const gateway = await startGateway({
+        env: environment(tokenFile),
+        listenPortOverride: 0,
+        routeTargets: { cloudflare: `${echoUrl}/mcp` },
+      });
+      await gateway.close();
+    } finally {
+      await closeServer(echoBackend);
+    }
+  });
+
+  it.each([
+    ['a URL without a path', 'http://127.0.0.1:8701'],
+    ['a non-/mcp path', 'http://127.0.0.1:8701/other'],
+    ['a URL with a query string', 'http://127.0.0.1:8701/mcp?x=1'],
+    ['a URL with credentials', 'http://user:pass@127.0.0.1:8701/mcp'],
+    ['a non-loopback host', 'http://192.0.2.9:8701/mcp'],
+    ['a URL without a port', 'http://localhost/mcp'],
+    ['an https URL', 'https://127.0.0.1:8701/mcp'],
+  ])('refuses %s as a route target', async (_name, target) => {
+    await expect(
+      startGateway({
+        env: environment(tokenFile),
+        listenPortOverride: 0,
+        routeTargets: { cloudflare: target },
+      }),
+    ).rejects.toThrow('http://<loopback>:<port>/mcp');
+  });
+
+  const productionEnvironment = {
+    NODE_ENV: 'production',
+    TN_AUTH_MODE: 'access',
+    TN_LOG_LEVEL: 'silent',
+  } as const;
+
+  it.each([
+    ['listenPortOverride', { listenPortOverride: 0 }],
+    ['routeTargets', { routeTargets: { cloudflare: 'http://127.0.0.1:8701/mcp' } }],
+    ['upstreamTimeoutMs', { upstreamTimeoutMs: 1_000 }],
+    ['headersTimeoutMs', { headersTimeoutMs: 1_000 }],
+  ] as const)('refuses the %s override in production', async (name, overrides) => {
+    await expect(startGateway({ env: productionEnvironment, ...overrides })).rejects.toThrow(
+      `${name} is test-only and cannot be used in production`,
+    );
+  });
+
+  it('refuses the dependency seam in production', async () => {
+    await expect(
+      startGateway(
+        { env: productionEnvironment },
+        {
+          authenticator: {
+            async authenticate() {
+              return { ok: true, principal: { kind: 'dev', id: 'dev', scopes: [] } };
+            },
+          },
+        },
+      ),
+    ).rejects.toThrow('dependency overrides are test-only and cannot be used in production');
+  });
+
+  it('refuses the dependency seam logger alone in production', async () => {
+    await expect(
+      startGateway(
+        { env: productionEnvironment },
+        {
+          logger: {
+            info() {},
+            warn() {},
+            error() {},
+          },
+        },
+      ),
+    ).rejects.toThrow('dependency overrides are test-only and cannot be used in production');
   });
 });

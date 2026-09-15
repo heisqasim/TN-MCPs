@@ -25,8 +25,26 @@ export const ROUTES = [
 
 export const MAX_BODY_BYTES = 1_048_576;
 export const REQUEST_TIMEOUT_MS = 30_000;
+export const HEADERS_TIMEOUT_MS = 10_000;
+export const KEEP_ALIVE_TIMEOUT_MS = 5_000;
 export const SHUTDOWN_DRAIN_MS = 25_000;
 export const DEFAULT_RATE_LIMIT_PER_MINUTE = 120;
+
+// Cloudflare Tunnel always adds edge headers. Refusing them in dev mode prevents a
+// loopback-only development authenticator from becoming reachable through a tunnel.
+export const EDGE_HEADERS = Object.freeze([
+  'cf-ray',
+  'cf-connecting-ip',
+  'cf-ipcountry',
+  'cdn-loop',
+  'cf-visitor',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'forwarded',
+  'x-real-ip',
+  'cf-access-jwt-assertion',
+] as const);
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 
@@ -116,6 +134,16 @@ function processConfigSchema(processName: ProcessName) {
 export type NodeEnvironment = 'development' | 'test' | 'production';
 export type LogLevel = 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'silent';
 export type AuthMode = 'access' | 'dev';
+
+export function devModeEdgeHeaders(
+  authMode: AuthMode,
+  headers: Readonly<Record<string, unknown>>,
+): readonly string[] {
+  if (authMode !== 'dev') {
+    return [];
+  }
+  return EDGE_HEADERS.filter((header) => Object.hasOwn(headers, header));
+}
 
 export interface ProcessConfig {
   readonly process: ProcessName;

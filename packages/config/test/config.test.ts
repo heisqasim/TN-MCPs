@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_RATE_LIMIT_PER_MINUTE,
+  devModeEdgeHeaders,
+  EDGE_HEADERS,
   isLoopbackHost,
   loadProcessConfig,
   MAX_BODY_BYTES,
@@ -154,5 +156,41 @@ describe('B6 and B7 configuration boundaries', () => {
       expect(String(error)).toContain('TN_BIND_HOST');
       expect(String(error)).not.toContain(receivedValue);
     }
+  });
+});
+
+describe('B7 edge headers', () => {
+  it('lists the headers a tunnel or edge adds to forwarded traffic', () => {
+    expect(EDGE_HEADERS).toEqual([
+      'cf-ray',
+      'cf-connecting-ip',
+      'cf-ipcountry',
+      'cdn-loop',
+      'cf-visitor',
+      'x-forwarded-for',
+      'x-forwarded-host',
+      'x-forwarded-proto',
+      'forwarded',
+      'x-real-ip',
+      'cf-access-jwt-assertion',
+    ]);
+    expect(Object.isFrozen(EDGE_HEADERS)).toBe(true);
+  });
+
+  it('flags every listed edge header in dev mode', () => {
+    const headers = Object.fromEntries(EDGE_HEADERS.map((header) => [header, 'edge-value']));
+
+    expect(devModeEdgeHeaders('dev', headers)).toEqual([...EDGE_HEADERS]);
+  });
+
+  it('flags only the headers actually present', () => {
+    expect(devModeEdgeHeaders('dev', { 'cf-ray': 'edge', 'x-other': 'kept' })).toEqual(['cf-ray']);
+    expect(devModeEdgeHeaders('dev', {})).toEqual([]);
+  });
+
+  it('never flags edge headers in access mode (the edge is expected there)', () => {
+    const headers = Object.fromEntries(EDGE_HEADERS.map((header) => [header, 'edge-value']));
+
+    expect(devModeEdgeHeaders('access', headers)).toEqual([]);
   });
 });

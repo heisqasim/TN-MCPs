@@ -1,16 +1,7 @@
 import { startMcpBackend } from '@tn-mcps/mcp-common';
+import { formatStartupError } from '@tn-mcps/shared';
 
 import { version } from './server.js';
-
-function startupErrorMessage(error: unknown): string {
-  let message = error instanceof Error ? error.message : 'Unknown startup error';
-  for (const value of Object.values(process.env)) {
-    if (value !== undefined && value.length >= 4) {
-      message = message.replaceAll(value, '[REDACTED]');
-    }
-  }
-  return JSON.stringify({ error: message });
-}
 
 try {
   await startMcpBackend({
@@ -19,6 +10,6 @@ try {
     installSignalHandlers: true,
   });
 } catch (error) {
-  console.error(startupErrorMessage(error));
+  console.error(formatStartupError(error));
   process.exitCode = 1;
 }

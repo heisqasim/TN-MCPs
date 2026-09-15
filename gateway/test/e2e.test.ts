@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { connect as connectTcp } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -209,6 +209,42 @@ async function waitUntil(
   throw new Error(failureMessage());
 }
 
+// Readiness must not hang on a child that died: the exit promise is raced against the
+// readiness probe and turns an early exit into a failure carrying the child's stderr.
+async function waitUntilChildReady(
+  child: ManagedChild,
+  token: string,
+  label: string,
+  predicate: () => Promise<boolean>,
+): Promise<void> {
+  const earlyExit = child.exit.then((exit: ChildExit): never => {
+    throw new Error(
+      `${label} exited before it was ready (code ${exit.code}, signal ${exit.signal}): ${safeStderr(child, token)}`,
+    );
+  });
+  earlyExit.catch(() => undefined);
+
+  await Promise.race([
+    waitUntil(predicate, 5_000, () => `${label} did not become ready: ${safeStderr(child, token)}`),
+    earlyExit,
+  ]);
+}
+
+async function fetchHealthy(
+  url: string,
+  check: (body: Record<string, unknown>) => boolean,
+): Promise<boolean> {
+  try {
+    const response = await fetch(url);
+    if (response.status !== 200) {
+      return false;
+    }
+    return check((await response.json()) as Record<string, unknown>);
+  } catch {
+    return false;
+  }
+}
+
 async function listen(server: Server, port: number): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -319,22 +355,11 @@ describe('Phase 2 built-process E2E', () => {
     const startedGateway = spawnBuilt(gatewayEntry, processEnvironment(tokenFile));
     gateway = startedGateway;
 
-    await waitUntil(
-      () => tcpAccepts(8701),
-      5_000,
-      () => `cloudflare backend did not start: ${safeStderr(startedCloudflare, token)}`,
+    await waitUntilChildReady(startedCloudflare, token, 'cloudflare backend', () =>
+      fetchHealthy('http://127.0.0.1:8701/healthz', (body) => body.server === 'cloudflare'),
     );
-    await waitUntil(
-      async () => {
-        try {
-          const response = await fetch('http://127.0.0.1:8790/healthz');
-          return response.status === 200;
-        } catch {
-          return false;
-        }
-      },
-      5_000,
-      () => `gateway did not become healthy: ${safeStderr(startedGateway, token)}`,
+    await waitUntilChildReady(startedGateway, token, 'gateway', () =>
+      fetchHealthy('http://127.0.0.1:8790/healthz', (body) => body.status === 'ok'),
     );
   });
 
@@ -381,6 +406,29 @@ describe('Phase 2 built-process E2E', () => {
     } finally {
       await client.close();
     }
+  });
+
+  it('serves a /healthz version matching the gateway package', async () => {
+    const response = await fetch('http://127.0.0.1:8790/healthz');
+    expect(response.status).toBe(200);
+
+    const packageJson = JSON.parse(
+      await readFile(join(repositoryRoot, 'gateway/package.json'), 'utf8'),
+    ) as { version: string };
+    expect(await response.json()).toEqual({ status: 'ok', version: packageJson.version });
+  });
+
+  it('accepts a raw legacy JSON-RPC notification with no id', async () => {
+    const response = await postRaw(
+      gatewayUrl,
+      token,
+      JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+    );
+
+    // MCP 2025-03-26 §2.1 (Streamable HTTP): notifications without an id are answered
+    // with 202 Accepted and an empty body. Assert the actual SDK behavior.
+    expect(response.status).toBe(202);
+    expect(response.text).toBe('');
   });
 
   it('rejects text/plain content with the SDK media-type error', async () => {
@@ -724,5 +772,21 @@ describe('Phase 2 built-process E2E', () => {
       ['TN_BIND_HOST'],
       ['0.0.0.0'],
     );
+  });
+
+  it('fails readiness immediately when a spawned child exits before it is ready', async () => {
+    const dying = spawnBuilt(
+      cloudflareEntry,
+      processEnvironment(tokenFile, { TN_BIND_HOST: '0.0.0.0' }),
+    );
+    try {
+      await expect(
+        waitUntilChildReady(dying, token, 'unready cloudflare backend', () =>
+          fetchHealthy('http://127.0.0.1:8701/healthz', (body) => body.server === 'cloudflare'),
+        ),
+      ).rejects.toThrow(/exited before it was ready.*TN_BIND_HOST/s);
+    } finally {
+      await stopChild(dying);
+    }
   });
 });

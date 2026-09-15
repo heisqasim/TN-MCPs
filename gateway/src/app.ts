@@ -16,7 +16,10 @@ import {
   type Principal,
 } from '@tn-mcps/auth';
 import {
+  devModeEdgeHeaders,
+  HEADERS_TIMEOUT_MS,
   isLoopbackHost,
+  KEEP_ALIVE_TIMEOUT_MS,
   loadProcessConfig,
   MAX_BODY_BYTES,
   PROCESS_PORTS,
@@ -40,6 +43,7 @@ export interface StartGatewayOptions {
   listenPortOverride?: number;
   routeTargets?: Partial<Record<BackendProcessName, string | URL>>;
   upstreamTimeoutMs?: number;
+  headersTimeoutMs?: number;
   installSignalHandlers?: boolean;
 }
 
@@ -50,6 +54,7 @@ export interface RunningGateway {
 
 interface GatewayLogger {
   info(bindings: Record<string, unknown>, message: string): void;
+  warn(bindings: Record<string, unknown>, message: string): void;
   error(bindings: Record<string, unknown>, message: string): void;
 }
 
@@ -95,6 +100,60 @@ function sendJson(response: ServerResponse, status: number, body: Record<string,
     'content-length': Buffer.byteLength(serialized).toString(),
   });
   response.end(serialized);
+}
+
+// A rejected request must never hold a keep-alive connection with a pending body: the
+// response declares `Connection: close`, the remaining body is drained under a hard
+// bound, and the socket is then destroyed so no client-side reuse is possible.
+const REJECTION_DRAIN_MS = 1_000;
+const REJECTION_DRAIN_BYTES = 65_536;
+
+function beginRejectionTeardown(request: IncomingMessage, response: ServerResponse): () => void {
+  response.setHeader('connection', 'close');
+  let settled = false;
+  let drained = 0;
+  const drainChunk = (chunk: Buffer | string): void => {
+    drained += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.byteLength;
+    if (drained > REJECTION_DRAIN_BYTES) {
+      teardown();
+    }
+  };
+  const teardown = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(hardBound);
+    request.off('data', drainChunk);
+    request.socket?.destroy();
+  };
+  const cancel = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(hardBound);
+    request.off('data', drainChunk);
+    request.off('aborted', teardown);
+    request.off('error', teardown);
+    response.off('close', teardown);
+  };
+  const hardBound = setTimeout(teardown, REJECTION_DRAIN_MS);
+  hardBound.unref();
+  request.once('aborted', teardown);
+  request.once('error', teardown);
+  response.once('close', teardown);
+  return cancel;
+}
+
+function rejectJson(
+  request: IncomingMessage,
+  response: ServerResponse,
+  status: number,
+  body: Record<string, unknown>,
+): void {
+  beginRejectionTeardown(request, response);
+  sendJson(response, status, body);
 }
 
 function requestPath(request: IncomingMessage): string {
@@ -164,15 +223,14 @@ function normalizeTarget(input: string | URL): URL {
   if (
     target.protocol !== 'http:' ||
     !isLoopbackHost(hostname) ||
+    target.port.length === 0 ||
     target.username.length > 0 ||
     target.password.length > 0 ||
+    target.pathname !== '/mcp' ||
     target.search.length > 0 ||
     target.hash.length > 0
   ) {
-    throw new Error('Gateway route targets must be plain loopback HTTP URLs');
-  }
-  if (target.pathname === '/' || target.pathname.length === 0) {
-    target.pathname = '/mcp';
+    throw new Error('Gateway route targets must match http://<loopback>:<port>/mcp exactly');
   }
   return target;
 }
@@ -190,7 +248,7 @@ function buildRouteTargets(
   const targets = new Map<BackendProcessName, URL>();
   for (const route of ROUTES) {
     const configured = overrides?.[route.process];
-    const target = configured ?? `http://127.0.0.1:${PROCESS_PORTS[route.process]}`;
+    const target = configured ?? `http://127.0.0.1:${PROCESS_PORTS[route.process]}/mcp`;
     targets.set(route.process, normalizeTarget(target));
   }
   return targets;
@@ -310,11 +368,34 @@ export async function startGateway(
   dependencies: StartGatewayDependencies = {},
 ): Promise<RunningGateway> {
   const config = loadProcessConfig('gateway', options.env);
+  if (config.nodeEnv === 'production') {
+    if (options.listenPortOverride !== undefined) {
+      throw new Error('listenPortOverride is test-only and cannot be used in production');
+    }
+    if (options.routeTargets !== undefined) {
+      throw new Error('routeTargets is test-only and cannot be used in production');
+    }
+    if (options.upstreamTimeoutMs !== undefined) {
+      throw new Error('upstreamTimeoutMs is test-only and cannot be used in production');
+    }
+    if (options.headersTimeoutMs !== undefined) {
+      throw new Error('headersTimeoutMs is test-only and cannot be used in production');
+    }
+    if (dependencies.authenticator !== undefined || dependencies.logger !== undefined) {
+      throw new Error(
+        'Gateway dependency overrides are test-only and cannot be used in production',
+      );
+    }
+  }
   const authenticator = dependencies.authenticator ?? createAuthenticator(config, 'gateway');
   const targets = buildRouteTargets(options.routeTargets);
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? REQUEST_TIMEOUT_MS;
   if (!Number.isFinite(upstreamTimeoutMs) || upstreamTimeoutMs <= 0) {
     throw new RangeError('upstreamTimeoutMs must be a positive finite number');
+  }
+  const headersTimeoutMs = options.headersTimeoutMs ?? HEADERS_TIMEOUT_MS;
+  if (!Number.isFinite(headersTimeoutMs) || headersTimeoutMs <= 0) {
+    throw new RangeError('headersTimeoutMs must be a positive finite number');
   }
 
   const logger = dependencies.logger ?? createLogger({ name: 'gateway', level: config.logLevel });
@@ -323,259 +404,280 @@ export async function startGateway(
   let hosts = allowedHostnames(config.publicBaseUrl);
   let origins = allowedOrigins(config.publicBaseUrl, activeListenPort);
 
-  const httpServer = createServer((request, response) => {
-    const requestId = acceptOrCreateRequestId(request.headers[REQUEST_ID_HEADER]);
-    request.headers[REQUEST_ID_HEADER] = requestId;
-    response.setHeader(REQUEST_ID_HEADER, requestId);
-    const routePath = requestPath(request);
-    const startedAt = performance.now();
-    let principalId: string | null = null;
-    let logged = false;
+  const httpServer = createServer(
+    {
+      requestTimeout: REQUEST_TIMEOUT_MS,
+      headersTimeout: headersTimeoutMs,
+      keepAliveTimeout: KEEP_ALIVE_TIMEOUT_MS,
+      connectionsCheckingInterval: Math.min(headersTimeoutMs, 1_000),
+    },
+    (request, response) => {
+      const requestId = acceptOrCreateRequestId(request.headers[REQUEST_ID_HEADER]);
+      request.headers[REQUEST_ID_HEADER] = requestId;
+      response.setHeader(REQUEST_ID_HEADER, requestId);
+      const routePath = requestPath(request);
+      const startedAt = performance.now();
+      let principalId: string | null = null;
+      let logged = false;
 
-    const logCompletion = () => {
-      if (logged) {
-        return;
-      }
-      logged = true;
-      logger.info(
-        {
-          requestId,
-          route: routePath,
-          principalId,
-          status: response.statusCode,
-          durationMs: Math.round(performance.now() - startedAt),
-        },
-        'request completed',
-      );
-    };
-    response.once('finish', logCompletion);
-    response.once('close', () => {
-      if (!response.writableEnded) {
-        response.statusCode = 499;
-      }
-      logCompletion();
-    });
-
-    void (async () => {
-      const hostname = hostnameFromHostHeader(request.headers.host);
-      if (hostname === undefined || !hosts.has(hostname)) {
-        sendJson(response, 403, { error: 'forbidden' });
-        return;
-      }
-      if (!originIsAllowed(request.headers.origin, origins)) {
-        sendJson(response, 403, { error: 'forbidden' });
-        return;
-      }
-
-      if (routePath === '/healthz' && request.method === 'GET') {
-        sendJson(response, 200, { status: 'ok', version: gatewayVersion });
-        return;
-      }
-
-      const route = findRoute(routePath);
-      if (route === undefined) {
-        sendJson(response, 404, { error: 'not found' });
-        return;
-      }
-      if (request.method !== 'POST') {
-        response.setHeader('allow', 'POST');
-        sendJson(response, 405, { error: 'method not allowed' });
-        return;
-      }
-
-      if (contentLengthExceedsLimit(request.headers)) {
-        response.setHeader('connection', 'close');
-        sendJson(response, 413, { error: 'request body too large' });
-        request.resume();
-        return;
-      }
-
-      const authentication = await authenticator.authenticate(request.headers);
-      if (!authentication.ok) {
-        sendJson(response, 401, { error: 'unauthorized' });
-        request.resume();
-        return;
-      }
-      principalId = authentication.principal.id;
-
-      const rateLimit = takeRateLimitToken(authentication.principal);
-      if (!rateLimit.allowed) {
-        response.setHeader('retry-after', rateLimit.retryAfterSeconds.toString());
-        sendJson(response, 429, { error: 'rate limit exceeded' });
-        request.resume();
-        return;
-      }
-
-      const target = targets.get(route.process);
-      if (target === undefined) {
-        sendJson(response, 503, { error: 'backend unavailable' });
-        return;
-      }
-      const forwarded = requestHeadersForUpstream(request.headers, requestId);
-      forwarded.host = targetHostHeader(target);
-      if (!addIdentityAssertion(forwarded, request.headers, config.authMode)) {
-        sendJson(response, 401, { error: 'unauthorized' });
-        request.resume();
-        return;
-      }
-
-      let bodyBytes = 0;
-      let bodyTooLarge = false;
-      let clientDisconnected = false;
-      let upstreamTimedOut = false;
-      let upstreamSettled = false;
-      let requestBodyComplete = false;
-      let pendingUpstreamResponse: IncomingMessage | undefined;
-
-      const forwardUpstreamResponse = (upstreamResponse: IncomingMessage) => {
-        if (bodyTooLarge || clientDisconnected || upstreamTimedOut) {
-          upstreamResponse.destroy();
+      const logCompletion = () => {
+        if (logged) {
           return;
         }
-        response.statusCode = upstreamResponse.statusCode ?? 502;
-        copyResponseHeaders(upstreamResponse, response);
-        upstreamResponse.once('end', () => {
-          upstreamSettled = true;
-          clearTimeout(timeout);
-        });
-        upstreamResponse.once('aborted', () => {
-          upstreamSettled = true;
-          clearTimeout(timeout);
-          if (!response.writableEnded) {
-            response.destroy();
-          }
-        });
-        upstreamResponse.once('error', () => {
-          upstreamSettled = true;
-          clearTimeout(timeout);
-          if (!response.writableEnded) {
-            response.destroy();
-          }
-        });
-        upstreamResponse.pipe(response);
+        logged = true;
+        logger.info(
+          {
+            requestId,
+            route: routePath,
+            principalId,
+            status: response.statusCode,
+            durationMs: Math.round(performance.now() - startedAt),
+          },
+          'request completed',
+        );
       };
-
-      const upstreamRequest = httpRequest(
-        target,
-        {
-          method: 'POST',
-          headers: forwarded,
-          agent: false,
-        },
-        (upstreamResponse) => {
-          if (!requestBodyComplete) {
-            pendingUpstreamResponse = upstreamResponse;
-            upstreamResponse.pause();
-            return;
-          }
-          forwardUpstreamResponse(upstreamResponse);
-        },
-      );
-
-      const timeout = setTimeout(() => {
-        if (upstreamSettled || bodyTooLarge || clientDisconnected) {
-          return;
+      response.once('finish', logCompletion);
+      response.once('close', () => {
+        if (!response.writableEnded) {
+          response.statusCode = 499;
         }
-        upstreamTimedOut = true;
-        upstreamRequest.destroy();
-        pendingUpstreamResponse?.destroy();
-        if (response.headersSent) {
-          response.destroy();
-        } else {
-          sendJson(response, 504, { error: 'upstream timeout' });
-        }
-      }, upstreamTimeoutMs);
-      timeout.unref();
-
-      upstreamRequest.once('error', () => {
-        clearTimeout(timeout);
-        if (bodyTooLarge || clientDisconnected || upstreamTimedOut) {
-          return;
-        }
-        upstreamSettled = true;
-        if (response.headersSent) {
-          response.destroy();
-        } else {
-          sendJson(response, 503, { error: 'backend unavailable' });
-        }
+        logCompletion();
       });
 
-      const abortUpstream = () => {
-        if (response.writableEnded || upstreamSettled || bodyTooLarge) {
+      void (async () => {
+        const edgeHeaders = devModeEdgeHeaders(config.authMode, request.headers);
+        if (edgeHeaders.length > 0) {
+          logger.warn(
+            { edgeHeaders: redact(edgeHeaders), requestId },
+            'edge headers rejected in dev auth mode',
+          );
+          rejectJson(request, response, 403, { error: 'forbidden' });
           return;
         }
-        clientDisconnected = true;
-        clearTimeout(timeout);
-        upstreamRequest.destroy();
-        pendingUpstreamResponse?.destroy();
-      };
-      request.once('aborted', abortUpstream);
-      response.once('close', abortUpstream);
+        const hostname = hostnameFromHostHeader(request.headers.host);
+        if (hostname === undefined || !hosts.has(hostname)) {
+          rejectJson(request, response, 403, { error: 'forbidden' });
+          return;
+        }
+        if (!originIsAllowed(request.headers.origin, origins)) {
+          rejectJson(request, response, 403, { error: 'forbidden' });
+          return;
+        }
 
-      request.on('data', (chunk: Buffer | string) => {
-        if (bodyTooLarge || clientDisconnected || upstreamTimedOut || upstreamSettled) {
+        if (routePath === '/healthz' && request.method === 'GET') {
+          sendJson(response, 200, { status: 'ok', version: gatewayVersion });
           return;
         }
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        bodyBytes += buffer.byteLength;
-        if (bodyBytes > MAX_BODY_BYTES) {
-          bodyTooLarge = true;
-          clearTimeout(timeout);
+
+        const route = findRoute(routePath);
+        if (route === undefined) {
+          rejectJson(request, response, 404, { error: 'not found' });
+          return;
+        }
+        if (request.method !== 'POST') {
+          response.setHeader('allow', 'POST');
+          rejectJson(request, response, 405, { error: 'method not allowed' });
+          return;
+        }
+
+        if (contentLengthExceedsLimit(request.headers)) {
+          rejectJson(request, response, 413, { error: 'request body too large' });
+          return;
+        }
+
+        const authentication = await authenticator.authenticate(request.headers);
+        if (!authentication.ok) {
+          rejectJson(request, response, 401, { error: 'unauthorized' });
+          return;
+        }
+        principalId = authentication.principal.id;
+
+        const rateLimit = takeRateLimitToken(authentication.principal);
+        if (!rateLimit.allowed) {
+          response.setHeader('retry-after', rateLimit.retryAfterSeconds.toString());
+          rejectJson(request, response, 429, { error: 'rate limit exceeded' });
+          return;
+        }
+
+        const target = targets.get(route.process);
+        if (target === undefined) {
+          rejectJson(request, response, 503, { error: 'backend unavailable' });
+          return;
+        }
+        const forwarded = requestHeadersForUpstream(request.headers, requestId);
+        forwarded.host = targetHostHeader(target);
+        if (!addIdentityAssertion(forwarded, request.headers, config.authMode)) {
+          rejectJson(request, response, 401, { error: 'unauthorized' });
+          return;
+        }
+
+        let bodyBytes = 0;
+        let bodyTooLarge = false;
+        let clientDisconnected = false;
+        let upstreamTimedOut = false;
+        let upstreamSettled = false;
+        let requestBodyComplete = false;
+        let pendingUpstreamResponse: IncomingMessage | undefined;
+
+        const forwardUpstreamResponse = (upstreamResponse: IncomingMessage) => {
+          if (bodyTooLarge || clientDisconnected || upstreamTimedOut) {
+            upstreamResponse.destroy();
+            return;
+          }
+          response.statusCode = upstreamResponse.statusCode ?? 502;
+          copyResponseHeaders(upstreamResponse, response);
+          upstreamResponse.once('end', () => {
+            upstreamSettled = true;
+            clearTimeout(timeout);
+          });
+          upstreamResponse.once('aborted', () => {
+            upstreamSettled = true;
+            clearTimeout(timeout);
+            if (!response.writableEnded) {
+              response.destroy();
+            }
+          });
+          upstreamResponse.once('error', () => {
+            upstreamSettled = true;
+            clearTimeout(timeout);
+            if (!response.writableEnded) {
+              response.destroy();
+            }
+          });
+          upstreamResponse.pipe(response);
+        };
+
+        const upstreamRequest = httpRequest(
+          target,
+          {
+            method: 'POST',
+            headers: forwarded,
+            agent: false,
+          },
+          (upstreamResponse) => {
+            if (!requestBodyComplete) {
+              pendingUpstreamResponse = upstreamResponse;
+              upstreamResponse.pause();
+              return;
+            }
+            forwardUpstreamResponse(upstreamResponse);
+          },
+        );
+
+        const timeout = setTimeout(() => {
+          if (upstreamSettled || bodyTooLarge || clientDisconnected) {
+            return;
+          }
+          upstreamTimedOut = true;
           upstreamRequest.destroy();
           pendingUpstreamResponse?.destroy();
           if (response.headersSent) {
             response.destroy();
           } else {
-            response.setHeader('connection', 'close');
-            sendJson(response, 413, { error: 'request body too large' });
+            rejectJson(request, response, 504, { error: 'upstream timeout' });
           }
-          request.resume();
-          return;
-        }
-        if (!upstreamRequest.write(buffer)) {
-          request.pause();
-          upstreamRequest.once('drain', () => request.resume());
+        }, upstreamTimeoutMs);
+        timeout.unref();
+
+        upstreamRequest.once('error', () => {
+          clearTimeout(timeout);
+          if (bodyTooLarge || clientDisconnected || upstreamTimedOut) {
+            return;
+          }
+          upstreamSettled = true;
+          if (response.headersSent) {
+            response.destroy();
+          } else {
+            rejectJson(request, response, 503, { error: 'backend unavailable' });
+          }
+        });
+
+        const abortUpstream = () => {
+          if (response.writableEnded || upstreamSettled || bodyTooLarge) {
+            return;
+          }
+          clientDisconnected = true;
+          clearTimeout(timeout);
+          upstreamRequest.destroy();
+          pendingUpstreamResponse?.destroy();
+        };
+        request.once('aborted', abortUpstream);
+        response.once('close', abortUpstream);
+
+        request.on('data', (chunk: Buffer | string) => {
+          if (bodyTooLarge || clientDisconnected || upstreamTimedOut || upstreamSettled) {
+            return;
+          }
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bodyBytes += buffer.byteLength;
+          if (bodyBytes > MAX_BODY_BYTES) {
+            bodyTooLarge = true;
+            clearTimeout(timeout);
+            upstreamRequest.destroy();
+            pendingUpstreamResponse?.destroy();
+            if (response.headersSent) {
+              response.destroy();
+            } else {
+              rejectJson(request, response, 413, { error: 'request body too large' });
+            }
+            return;
+          }
+          if (!upstreamRequest.write(buffer)) {
+            request.pause();
+            upstreamRequest.once('drain', () => request.resume());
+          }
+        });
+        request.once('end', () => {
+          requestBodyComplete = true;
+          if (!bodyTooLarge && !clientDisconnected && !upstreamTimedOut && !upstreamSettled) {
+            upstreamRequest.end();
+            if (pendingUpstreamResponse !== undefined) {
+              const upstreamResponse = pendingUpstreamResponse;
+              pendingUpstreamResponse = undefined;
+              forwardUpstreamResponse(upstreamResponse);
+              upstreamResponse.resume();
+            }
+          }
+        });
+        request.once('error', abortUpstream);
+      })().catch((error: unknown) => {
+        logger.error({ error: redact(error), requestId }, 'unexpected request pipeline error');
+        if (response.headersSent) {
+          response.destroy();
+        } else {
+          rejectJson(request, response, 500, { error: 'internal server error' });
         }
       });
-      request.once('end', () => {
-        requestBodyComplete = true;
-        if (!bodyTooLarge && !clientDisconnected && !upstreamTimedOut && !upstreamSettled) {
-          upstreamRequest.end();
-          if (pendingUpstreamResponse !== undefined) {
-            const upstreamResponse = pendingUpstreamResponse;
-            pendingUpstreamResponse = undefined;
-            forwardUpstreamResponse(upstreamResponse);
-            upstreamResponse.resume();
-          }
-        }
-      });
-      request.once('error', abortUpstream);
-    })().catch((error: unknown) => {
-      logger.error({ error: redact(error), requestId }, 'unexpected request pipeline error');
-      if (response.headersSent) {
-        response.destroy();
-      } else {
-        sendJson(response, 500, { error: 'internal server error' });
-      }
-    });
-  });
+    },
+  );
 
   const lifecycle = createHttpLifecycle(httpServer, { drainMs: SHUTDOWN_DRAIN_MS });
+  const logShutdownFailure = (error: unknown) => {
+    logger.error({ error: redact(error) }, 'gateway shutdown failed');
+    process.exitCode = 1;
+  };
   const signalHandler = () => {
-    void lifecycle.shutdown();
+    void lifecycle.shutdown().catch(logShutdownFailure);
   };
   if (options.installSignalHandlers === true) {
     process.once('SIGTERM', signalHandler);
     process.once('SIGINT', signalHandler);
   }
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once('error', reject);
-    httpServer.listen(options.listenPortOverride ?? config.port, config.bindHost, () => {
-      httpServer.off('error', reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once('error', reject);
+      httpServer.listen(options.listenPortOverride ?? config.port, config.bindHost, () => {
+        httpServer.off('error', reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    process.off('SIGTERM', signalHandler);
+    process.off('SIGINT', signalHandler);
+    await lifecycle.shutdown().catch(logShutdownFailure);
+    throw error;
+  }
 
   const address = httpServer.address();
   if (address === null || typeof address === 'string') {
