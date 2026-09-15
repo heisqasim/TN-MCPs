@@ -1,15 +1,73 @@
 # TN-MCPs Master Plan
 
-The authoritative implementation plan for the Telos Nexus MCP control plane. An
+The revision 3 execution plan for the Telos Nexus MCP control plane. An
 engineer (human or agent) with no other context should be able to implement the whole
 project from this document plus the others in `docs/`. When reality and this plan
 diverge, update the plan in the same change.
 
 - Owner: Qasim (heisqasim)
 - Host: Oracle Cloud A1 VM (see [DEPLOYMENT_A1.md](DEPLOYMENT_A1.md))
-- Target endpoint: `https://mcp.telosnexus.cloud/mcp`
-- Plan written: 2026-09-15 · Revision 2 (after two independent design critiques; see
-  Part D) · Current phase: **1: Repository foundation**
+- Public endpoints: `https://mcp.telosnexus.cloud/{cloudflare,github,oracle,telos}/mcp`
+- Plan written: 2026-09-15 · Revision 3 (owner-contract alignment; see Part D) ·
+  Current phase: **1: Repository foundation**
+
+## Relationship to the owner's contract
+
+[`TN_MCPS_MASTER_IMPLEMENTATION_PLAN.md`](TN_MCPS_MASTER_IMPLEMENTATION_PLAN.md) is
+the architecture and security contract. This document is the execution plan that
+implements it. Where they differ, the differences are listed below for owner sign-off;
+the contract is never silently overridden. The 0–15 numbering is retained from the
+owner's session brief.
+
+| Owner-contract phase | MASTER_PLAN implementation |
+| --- | --- |
+| P0 foundation | MP 1, preceded by MP 0 discovery |
+| P1 minimal authenticated remote MCP | MP 2: thin gateway + `mcps/cloudflare` skeleton, `tn_status`, dev-token auth, and local HTTP |
+| P2 A1 deployment | MP 6 WP 6.1–6.2, including crash and owner-scheduled reboot-survival checks |
+| P3 Tunnel + edge security | MP 4 auth/spike + MP 6 WP 6.3 |
+| P4 Cloudflare read-only | MP 5, after MP 3 policy/audit |
+| P5 Cloudflare safe writes | MP 9, after MP 8 operational readiness |
+| P6 destructive approval boundary | MP 3 framework with production R3 hard-disable + MP 8 approvals app |
+| P7 GitHub · P8 Oracle · P9 Telos-control · P10 JARVIS | MP 10 · MP 11 · MP 13 · MP 14 |
+| Session-brief additions | MP 12 Firebase and MP 15 other clients; the contract lists Firebase as a future candidate |
+
+MP 2's new gate is local and harmless: on the VM, the operator reads the development
+token from its protected local file into `TN_DEV_TOKEN`, registers
+`http://127.0.0.1:8790/cloudflare/mcp`, and calls only `tn_status`:
+
+```bash
+claude mcp add --transport http --scope local tn-local http://127.0.0.1:8790/cloudflare/mcp --header "Authorization: Bearer ${TN_DEV_TOKEN}"
+```
+
+The token is never committed or pasted into chat.
+
+### Deviations requiring owner sign-off
+
+| Contract says | This plan does | Why | Owner action |
+| --- | --- | --- | --- |
+| Approvals may initially be local/manual | Production R3 approvals use only the separate Access approvals app; the local CLI can approve only outside production; R3 is hard-disabled in production until the app exists | AI CLIs run as `ubuntu` with passwordless sudo, so local CLI/TTY approval cannot distinguish owner from agent (B12/B13) | Sign off; decide Q11 before writes |
+| P5 safe writes follows read-only | MP 9 additionally requires MP 8 off-box audit, failure injection, restore drill, and Q11 decision | The first real mutation needs tamper-evident off-box audit and a decided agent-sudo policy | Complete MP 8 and Q11 |
+| Tunnel service example is `cloudflared.service` | Dedicated unit is `tn-mcp-tunnel.service` | A user-level unit with the generic name already serves another Telos system; reusing it is confusing and collides with `cloudflared service install` | Approve the dedicated unit |
+| Lowercase doc names and a separate `operations.md` | Session-brief names are retained; deployment/rollback live in DEPLOYMENT_A1 and incident response in SECURITY §9 until MP 8 creates `docs/OPERATIONS.md` | Preserve requested filenames and avoid a premature empty document | Sign off on filename mapping |
+| Generic provider API may sit behind an advanced/admin boundary | Upstream execution exists only as `cf_api_execute`, with exact-code, code-hash-bound, per-call approval | This is stricter and makes arbitrary JavaScript visible to the owner | Explicitly enable and provision if ever needed |
+
+### Cloudflare MVP definition of done
+
+| Contract §30 item | Satisfied by |
+| --- | --- |
+| Reproducible build; tests/lint/typecheck pass | MP 1 WP 1.1 and every phase gate |
+| Streamable HTTP | MP 2 WP 2.2–2.3 |
+| A1 services bind locally and run under supervision | MP 6 WP 6.2 |
+| `mcp.telosnexus.cloud` resolves through Tunnel; no public origin port | MP 6 WP 6.3 |
+| Authentication required; Claude Code authenticates/connects | MP 4 WP 4.0–4.2, MP 6 WP 6.3, MP 7 |
+| Read-only Cloudflare tools work | MP 5 |
+| Calls audited and secrets redacted | MP 3 WP 3.1/3.4, MP 5 tests |
+| Write scope separated from read scope | MP 3 policy contract, MP 9 Token C |
+| Safe reversible non-production write tested and reverted | MP 9 final WP |
+| Destructive operation denied or approval-gated | MP 3 R3 hard-disable/tests + MP 8 approvals app |
+| Existing production DNS/routes remain intact | MP 6/9 denylist, preconditions, owner-scoped live test |
+| Crash recovery and reboot survival verified | MP 6 WP 6.2 |
+| Rollback documented and rehearsed | DEPLOYMENT_A1 §4; MP 6 acceptance |
 
 ---
 
@@ -17,15 +75,15 @@ diverge, update the plan in the same change.
 
 ### A.1 What this is, and what it is not
 
-TN-MCPs is **one authenticated MCP gateway** that gives AI clients policy-checked,
-audited, approval-gated access to Telos Nexus infrastructure providers, plus the
-shared packages (auth, policy, audit, approvals) and deployment tooling behind it.
+TN-MCPs is a **multi-MCP control plane**: separate provider MCP server processes sit
+behind a thin authenticated gateway and share one implementation of auth, policy,
+audit, approvals, configuration, and observability.
 
 It is **not**:
 - a re-implementation of Cloudflare's (or anyone's) API. It wraps official SDKs and
   official MCP servers;
-- a set of independent per-provider MCP servers. There is one gateway, and providers
-  are libraries (ARCHITECTURE §9);
+- one credential-bearing monolith. The gateway routes requests and owns approvals but
+  holds no provider credentials; each MCP server holds only its provider credential;
 - an OAuth authorization server. Cloudflare Access plays that role;
 - a place where an AI can approve its own actions. Production approvals come from a
   separately authenticated human channel (A.3 B12).
@@ -60,7 +118,7 @@ It is **not**:
 7. `telosnexus.cloud` is on Cloudflare DNS. `mcp.telosnexus.cloud` has no record.
 8. VM: Ubuntu 20.04 (out of standard support), arm64, Node 24.20.0, systemd 245 (no
    `LoadCredential=`), cgroup v1, no Docker, cloudflared 2026.9.1, NTP synchronized,
-   swap 100% used, port 8787 free. **The `ubuntu` user (under which AI agent CLIs run)
+   swap 100% used. Ports 8790 and 8701–8704 were free. **The `ubuntu` user (under which AI agent CLIs run)
    has passwordless sudo.**
 9. GitHub: self-hosted runners "should almost never be used for public repositories".
    Environments with required reviewers are available for public repos on Free.
@@ -75,13 +133,14 @@ It is **not**:
 | S1 | Claude Code completes Access Managed OAuth end to end (incl. RFC 8707 `resource`) against **our own Access app** | **Highest.** The auth design changes (fallback: MCP portal in front) | WP 4.0 step B: Managed OAuth app over a throwaway Worker. Step A (portal) is only a cheaper first signal | 4 |
 | S2 | Access forwards `Cf-Access-Jwt-Assertion` for Managed OAuth and service-token requests, and the claims match A.2 #5 | Gateway auth design changes | WP 4.0 step B origin dumps claim *names* (not values) | 4 |
 | S3 | The Telos Zero Trust plan includes Managed OAuth and MCP portals | Fall back to service tokens for all clients | Owner checks the dashboard | 4 |
-| S4 | `node:sqlite` (Node 24) works for the approvals store: WAL, `busy_timeout`, and a concurrent CLI + gateway writer, without native deps | Swap to a JSON-file store with advisory locks | WP 3.3 spike test | 3 |
+| S4 | `node:sqlite` (Node 24) works for the gateway-owned approvals store: WAL and `busy_timeout`, without native deps | Swap to a JSON-file store with advisory locks | WP 3.3 spike test | 3 |
 | S5 | The official `cloudflare` SDK v7 covers all Phase 5 read endpoints | Some tools use raw `GET` paths through the same GET-only client | WP 5.1 | 5 |
 | S6 | 512 MB is enough for the gateway under the VM's memory pressure, and `MemoryMax=` is enforced on this cgroup-v1 host | Raise the limit, trim, or use `MemoryLimit=` | WP 6.2 check + WP 6.4 soak | 6 |
 | S7 | The upstream Cloudflare API MCP accepts a server-side bearer token from an SDK v2 client and `search` works without account access | Drop the upstream adapter; curated tools only | WP 5.0: script, SDK client + Token B, call `search` | 5 |
 | S8 | With Managed OAuth, Access serves both `/.well-known/oauth-protected-resource` (RFC 9728) and `/.well-known/oauth-authorization-server` on the app hostname, so the gateway serves neither | Gateway must serve PRM; route table and S1 change | WP 4.0 step B: `curl` both paths | 4 |
 | S9 | Claude Code sessions survive past the Access access-token lifetime (refresh tokens issued to DCR/CIMD clients) | Re-login every ~15 min; raise lifetime or change client strategy | WP 4.0 step B: keep a session > 20 min, call a tool again | 4 |
 | S10 | A CI-built release artifact with GitHub build-provenance attestation can be verified on the VM without the owner's GitHub credentials | Keep the rebuild-and-test-on-host deploy (baseline) | WP 8.6 spike | 8 |
+| S11 | Access Managed OAuth works with path-scoped Access applications and Claude Code sends the full path URL as the RFC 8707 resource | Use per-provider single-label hostnames: `mcp-cloudflare.telosnexus.cloud`, `mcp-github.telosnexus.cloud`, etc.; two-level names such as `cloudflare.mcp.telosnexus.cloud` are not covered by a standard one-level wildcard edge certificate | WP 4.0 step B: test two paths and verify each resource/audience | 4 |
 
 ### A.3 Boundaries and how each is enforced
 
@@ -90,18 +149,18 @@ tracked to be hardened.
 
 | # | Boundary | Enforcement | Strength | From |
 | --- | --- | --- | --- | --- |
-| B1 | Only `servers/gateway` imports the MCP **server** SDK | Other packages don't list `@modelcontextprotocol/server`; `scripts/check-boundaries.mjs` fails CI on any import of it outside `servers/gateway` | Structural + gate | 2 |
-| B2 | Every tool goes through the policy wrapper | `check-boundaries.mjs` also fails on any SDK registration call (`registerTool`, `registerResource`, `registerPrompt`, `.tool(`) outside `servers/gateway/src/policy-wrapper.ts`; a test asserts the registered tool set equals the policy registry | Gate + test | 2 / 3 |
+| B1 | Only `packages/mcp-common` imports the MCP **server** SDK | MCP servers are built only through `createTelosMcpServer({ name, tools })`; `scripts/check-boundaries.mjs` fails CI on any import of `@modelcontextprotocol/server` outside `packages/mcp-common` | Structural + gate | 2 |
+| B2 | Every tool goes through the shared policy wrapper | `check-boundaries.mjs` fails on any SDK registration call (`registerTool`, `registerResource`, `registerPrompt`, `.tool(`) outside `packages/mcp-common/src/policy-wrapper.ts`; a test for each `mcps/*` server asserts its registered tool set equals its policy registry | Gate + test | 2 / 3 |
 | B3 | Read tools can't mutate | Read tools receive a **GET-only** provider client (the type exposes only `get`/`list`; a test asserts no other HTTP method is ever issued), and their token has only read permission groups | Structural (type + credential) | 5 |
-| B4 | Destructive ops need a human approval | Registry test: `risk: 'destructive'` ⇒ `approval: 'always'`; the policy engine has no bypass flag; approval binding tests (args hash, precondition, principal, expiry, single use) | Test + runtime | 3 |
-| B5 | No token passthrough | After authentication the gateway removes `authorization`, `cookie`, `cf-access-*` from anything downstream; `ctx` exposes no raw request; test asserts a provider handler can't observe the inbound credential | Structural + test | 4 |
-| B6 | Gateway listens on loopback only | Config schema rejects a non-loopback `TN_MCP_HOST`; test for the schema; `preflight.sh` asserts via `ss -tlnp` that 8787 is bound to `127.0.0.1` only. (No systemd `IPAddressDeny`: it would also block provider egress) | Runtime + test + gate | 2 / 6 |
-| B7 | The dev authenticator is never reachable from outside | `TN_AUTH_MODE` is explicit (`access` \| `dev`). `dev` is refused unless `NODE_ENV=development` **and** `TN_MCP_PUBLIC_URL` is unset or a loopback URL; `preflight.sh` refuses to deploy anything but `access`. Loopback bind alone is **not** isolation, because a tunnel forwards to loopback | Runtime + test + gate | 2 / 6 |
+| B4 | R3 ops need a human approval every time | Registry test: `risk: 'R3'` ⇒ `approval: 'always'` and scope `admin:destructive`; the policy engine has no bypass flag; production registry refuses R3 until MP 8; approval binding tests cover args hash, precondition, principal, expiry, and single use | Test + runtime | 3 / 8 |
+| B5 | No token passthrough | After early JWT verification, the gateway strips `Authorization` and `Cookie` before proxying while forwarding `Cf-Access-Jwt-Assertion`; raw request/credentials never enter tool context. Each backend re-verifies the assertion against its own AUD. Tests prove a handler cannot observe the stripped headers or another app's token | Structural + test | 4 |
+| B6 | Every process listens on its assigned loopback address only | Typed central config rejects non-loopback binds for gateway 8790 and MCP ports 8701–8704; `preflight.sh` asserts all configured sockets with `ss -tlnp`. (No systemd `IPAddressDeny`: it would also block provider egress) | Runtime + test + gate | 2 / 6 |
+| B7 | The dev authenticator is never reachable from outside | `TN_AUTH_MODE` is explicit (`access` \| `dev`). `dev` is refused unless `NODE_ENV=development` **and** `TN_PUBLIC_BASE_URL` is unset or a loopback URL; `preflight.sh` refuses to deploy anything but `access`. Loopback bind alone is **not** isolation, because a tunnel forwards to loopback | Runtime + test + gate | 2 / 6 |
 | B8 | No secrets in the repo | GitHub push protection + secret scanning (server-side); `scripts/guard-secrets.mjs` in `pnpm run check` and CI | Strong + weak | 1 |
 | B9 | CI can't touch the VM or secrets | GitHub-hosted runner only; `permissions: contents: read`; no secrets referenced; deploy is pull-based | Structural | 1 |
-| B10 | Upstream Cloudflare API MCP can't mutate through the gateway | Only its `search` tool (OpenAPI-spec search, no account API calls) is exposed; `execute` is not proxied. The adapter's allowlist of upstream tool names is a constant, and a test fails if the adapter forwards any other name. The adapter only imports the read-token loader | Structural + test | 5 |
-| B11 | Existing VM services are untouched | `deploy.sh`/`rollback.sh`/`preflight.sh` operate only on units matching `tn-mcps-*` and refuse any other name; the rest is prose (this plan, CLAUDE.md) | Gate + prose | 6 |
-| B12 | A production approval can't be granted by the requesting client or an agent's session | Approvals are decided only through a **separate Access application** (`approve.telosnexus.cloud`) with its own AUD tag, owner-only policy, IdP MFA, and short session. The gateway accepts a decision only with an Access JWT whose `aud` is the approvals AUD and whose identity is a human `admin` who isn't the requester. MCP-app tokens can't satisfy that audience check. The local CLI can `list`/`show`/`deny` but can only `approve` when `NODE_ENV≠production` | Structural (audience) + runtime + test | 3 / 8 |
+| B10 | Generic upstream execution is an explicit R3 boundary | Upstream `search` is exposed freely as R0 `cf_api_search`. Upstream `execute` is exposed only as disabled-by-default `cf_api_execute`; enabling it requires `cloudflare:admin`, per-call out-of-band approval showing the exact JavaScript and binding its code hash, and normally the read token. A constant allowlist and test assert that the adapter forwards only upstream names `search` and `execute` | Structural + test + approval | 5 / 8 |
+| B11 | Existing VM services are untouched | `deploy.sh`/`rollback.sh`/`preflight.sh` operate only on unit names matching `tn-mcp-*` and refuse all others; the rest is prose (this plan, CLAUDE.md) | Gate + prose | 6 |
+| B12 | A production approval can't be granted by the requesting client or an agent's session | The gateway is the sole approvals-store writer. MCP servers use `/run/tn-mcps/gateway.sock`; the gateway authenticates their Unix-socket peer UID with `SO_PEERCRED`. Decisions come only through a **separate Access application** (`approve.telosnexus.cloud`) with its own AUD, owner-only policy, IdP MFA, and short session. The gateway accepts a decision only from a human `admin` who is not the requester. The local CLI can `list`/`show`/`deny` but can `approve` only when `NODE_ENV!=production` | Structural (audience + peer UID) + runtime + test | 3 / 8 |
 | B13 | Residual: an agent running as `ubuntu` on the VM (passwordless sudo) can read provider tokens and bypass every local control | **Not enforced by TN-MCPs.** Mitigation is an owner decision (Q11) that must be made before Phase 9: agents on the VM run as a non-sudo user, or passwordless sudo is removed. Until then, write-capable credentials must not exist on the VM | Owner policy | 9 |
 
 ### A.4 Build direction
@@ -141,15 +200,15 @@ Claude Code → **Operational readiness** → **Writes**:
 
 ### A.7 Cross-cutting contracts (decided now so implementers don't diverge)
 
-**Tool definition** (`packages/core`, Phase 2):
+**Tool definition** (`packages/mcp-common`, Phase 2):
 
 ```ts
 interface ToolDefinition<I extends z.ZodType> {
   name: string;                         // <provider>_<verb>_<object>, ASCII snake_case
   provider: string;
-  risk: 'read' | 'write' | 'destructive';
+  risk: 'R0' | 'R1' | 'R2' | 'R3';
   scopes: string[];                     // e.g. ['cloudflare:dns:write']
-  approval: 'never' | 'policy' | 'always';   // destructive ⇒ 'always' (B4)
+  approval: 'never' | 'policy' | 'always';   // R3 ⇒ 'always' (B4)
   input: I;                             // zod v4; must NOT contain `approval_id`
   annotations: { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean };
   resources?(args: z.infer<I>): ResourceRef[];            // what the call touches, for policy rules
@@ -159,10 +218,41 @@ interface ToolDefinition<I extends z.ZodType> {
 type ResourceRef = { kind: string; id: string; environment?: 'production' | 'staging' | 'unknown' };
 ```
 
+Risk policy is fixed: R0 read-only and R1 reversible low-risk writes require the
+listed scope plus audit. R2 production writes require a stronger scope, target
+validation against the domain registry, and approval by default; the owner may relax
+approval per target only as recorded policy data. R3 destructive/account-wide actions
+require `admin:destructive` and a single-use out-of-band owner approval every time;
+this cannot be relaxed. Production R3 registrations are hard-disabled until MP 8's
+approvals app exists. Roles map to scope sets. Defaults: owner Claude Code gets
+`tn:read`, `cloudflare:read`; JARVIS gets `tn:read`, `cloudflare:read`, `github:read`,
+`oracle:read`; no normal client gets `admin:destructive`.
+
+The scope vocabulary is exactly: `tn:read`, `cloudflare:read`,
+`cloudflare:dns:write`, `cloudflare:deploy:write`, `cloudflare:tunnel:write`,
+`github:read`, `github:write`, `oracle:read`, `oracle:service:restart`,
+`telos:deploy`, `admin:destructive`, plus `cloudflare:admin` solely for
+`cf_api_execute`.
+
+**Domain policy data** (`packages/policy`, Phase 3; proposed until Q4):
+
+| Domain | Intended role | Classification |
+| --- | --- | --- |
+| `telosnexus.io` | canonical company identity | production |
+| `telosnexus.co` | alias/redirect to `.io` | production |
+| `telosnexus.services` | Services vertical | production |
+| `telosnexus.app` | product catalogue/app family | production |
+| `telosnexus.cloud` | cloud/runtime/infrastructure routes | production when the route serves a live service |
+| `telosnexus.space` | labs/research | non-production; R1 eligible |
+
+This registry validates R2 targets; it is not a migration engine. Stable OAuth
+callbacks, Android App Links, QR destinations, Firebase hosting, and other production
+URLs move only through deliberate migrations, never merely because `.cloud` exists.
+
 **Approval contract** (Phase 3 store, Phase 8 production channel):
 
-- Gated tools get a reserved optional argument **`approval_id`**, added by the policy
-  wrapper (never by providers). The model can only control arguments, so that's the
+- Gated tools get a reserved optional argument **`approval_id`**, added by mcp-common's
+  policy wrapper (never by an MCP implementation). The model can only control arguments, so that's the
   only transport every client supports. `approval_id` is **excluded** from the args
   hash by definition.
 - `argsHash = sha256(JCS(parsedArgs without approval_id))`, where JCS is RFC 8785 JSON
@@ -189,12 +279,13 @@ take `cursor` and `limit` (default 50, max 200) and return
 `{ items, nextCursor, truncated }`. When the cap bites, the wrapper truncates items
 and sets `truncated: true`. It never silently drops data.
 
-**Audit contract** (Phase 3): one record per line, JCS-serialized; fields `v`, `ts`,
+**Audit contract** (Phase 3): each process has its own chain under
+`/var/lib/tn-mcps/audit/<process>/`. One record per line, JCS-serialized; fields `v`, `ts`,
 `seq`, `keyId`, `prevHash`, `hmac`, `correlationId`, principal (`kind`, `id`),
 `clientInfo`, `tool`, `risk`, redacted `args`, `decision`, `approvalId?`, `outcome`,
 `durationMs`, `upstreamRequestIds`. The chain continues across daily files (the first
-record of day N+1 carries the hash of day N's last record). A single writer (the
-gateway process) appends with fsync. A partial last line found at startup is kept,
+record of day N+1 carries the hash of day N's last record). Each process is the sole
+writer of its own chain and appends with fsync. A partial last line found at startup is kept,
 and a `recovery` record is appended that names it. If the intent record can't be
 written (disk full, I/O error), the call is refused.
 
@@ -209,7 +300,7 @@ written (disk full, I/O error), the call is refused.
 | Approvals store locked or busy > 5 s | Gated calls refused; read tools unaffected |
 | Provider timeout (10 s default) / 5xx | `isError` with a retry hint; writes are never auto-retried |
 | Clock not synchronized (`timedatectl`) | `preflight.sh` refuses to deploy; the gateway logs a warning each minute |
-| Rate limits | In-memory token bucket per principal; **resets on restart**, accepted and documented (destructive ops are approval-gated regardless) |
+| Rate limits | In-memory token bucket per principal; **resets on restart**, accepted and documented (R3 ops are approval-gated regardless) |
 
 ---
 
@@ -244,7 +335,7 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
   GitHub-hosted runners, secret guard, documentation set.
 - **Why:** every later phase lands through this gate.
 - **Architecture decisions:** Node 24 LTS; TypeScript 7 strict ESM/NodeNext; pnpm 12
-  workspaces (`packages/*`, `providers/*`, `servers/*`); Biome 2; Vitest 5 projects from
+  workspaces (`packages/*`, `mcps/*`, `gateway`); Biome 2; Vitest 5 projects from
   the root; `tsc -b` project references; dependency build scripts blocked.
 - **Files:** root configs, `packages/shared/**`, `scripts/guard-secrets.mjs`,
   `.github/**`, `README.md`, `CLAUDE.md`, `.mcp.json`, `.env.example`, `docs/*`.
@@ -271,102 +362,111 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 
 ---
 
-### Phase 2: Gateway core (local only)
+### Phase 2: Thin gateway + first MCP skeleton (local only)
 
-- **Goal:** `servers/gateway`, a dual-era MCP server on `127.0.0.1`, built on the tool
-  contract (A.7), with one harmless tool, proven with the official SDK client in both
-  eras.
-- **Why:** the protocol layer must be correct before anything depends on it.
+- **Goal:** a dual-era `mcps/cloudflare` server on `127.0.0.1:8701`, reached only
+  through the thin gateway on `127.0.0.1:8790/cloudflare/mcp`, with the harmless R0
+  tool `tn_status` and no provider credential.
+- **Why:** prove both protocol eras, routing, auth boundaries, and the owner's process
+  topology before any provider integration.
 - **Architecture decisions:**
-  - `createMcpHandler(factory)` from `@modelcontextprotocol/server` 2.0.0, mounted on
-    `node:http` via `toNodeHandler` from `@modelcontextprotocol/node` 2.0.0 (peer
-    `hono`). `hostHeaderValidation([publicHost, '127.0.0.1', 'localhost'])` and
-    `originValidation([publicHost])` go in front, with a missing `Origin` allowed
-    (non-browser clients). No Express.
-  - Legacy mode `'stateless'` (default). `responseMode: 'json'` initially.
-  - Routes: `POST /mcp`; `GET /healthz` (no auth, `{status, version}` only); everything
-    else `404`. **S8 may add** `/.well-known/oauth-protected-resource/mcp` after Phase 4;
-    the route table lives in one module so that's a one-line change.
-  - `packages/core`: A.7 `ToolDefinition`, `defineTool()`, `Principal`, `ToolContext`,
-    `ToolRegistry` (sorted, rejects duplicates and any `input` containing `approval_id`).
-  - Authenticator interface. Phase 2 ships `DevTokenAuthenticator` only (B7 rules):
-    token from `TN_DEV_TOKEN_FILE`.
-  - Secret-file rule (shared helper in `@tn-mcps/shared`): the file must be a regular
-    file, not world-readable, and either owner-only (`0600`) or `0640` with the group
-    equal to the service's group. Otherwise refuse to start.
-  - Structured logging: `pino` to stderr; every logged object goes through `redact()`.
-  - Tool: `telos_server_info` (read): gateway version, spec revision, enabled providers.
-  - Result-size contract (A.7) enforced in the wrapper stub.
-- **Files:** `packages/core/**`, `servers/gateway/**`, `scripts/check-boundaries.mjs`,
-  root `tsconfig.json` references, `.env.example` (`TN_AUTH_MODE`, `TN_DEV_TOKEN_FILE`).
-- **Dependencies:** `@modelcontextprotocol/server@2.0.0`, `@modelcontextprotocol/node@2.0.0`,
-  `hono` (^4.11.4), `pino@10`; dev: `@modelcontextprotocol/client@2.0.0`.
+  - `packages/mcp-common` alone uses `createMcpHandler(factory)` from the official v2
+    SDK, mounted on `node:http` via `toNodeHandler`. It exports
+    `createTelosMcpServer({ name, tools })`; all `mcps/*` servers use this factory.
+    Legacy mode is stateless and response mode starts as JSON.
+  - `packages/config` owns typed central configuration, including the fixed default
+    ports: gateway 8790, Cloudflare 8701, GitHub 8702, Oracle 8703, Telos 8704.
+  - The gateway validates Host/Origin, limits bodies to 1 MiB, assigns/validates
+    `X-Request-Id`, rate-limits per principal, authenticates before proxying, strips
+    `Authorization` and `Cookie`, forwards `Cf-Access-Jwt-Assertion`, and routes the
+    four public paths. `GET /healthz` needs no auth and returns no internals.
+  - The Cloudflare skeleton re-authenticates, serves `POST /mcp`, and exposes only
+    `tn_status` (version, spec revision, server name). GET/DELETE `/mcp` return 405.
+  - Phase 2 uses `DevTokenAuthenticator` with `TN_AUTH_MODE=dev` and
+    `TN_DEV_TOKEN_FILE`; both gateway and backend validate it locally under B7.
+  - The secret-file rule requires a regular file, not world-readable, owner-only
+    (`0600`) or `0640` with the service group. Structured logs pass through `redact()`.
+  - The A.7 result-size contract is enforced by mcp-common's policy-wrapper stub.
+- **Files:** `packages/mcp-common/**`, `packages/config/**`,
+  `packages/observability/**`, `gateway/**`, `mcps/cloudflare/**`,
+  `scripts/check-boundaries.mjs`, root project references, `.env.example`.
+- **Dependencies:** `@modelcontextprotocol/server@2.0.0`,
+  `@modelcontextprotocol/node@2.0.0`, `hono` (^4.11.4), `pino@10`; dev:
+  `@modelcontextprotocol/client@2.0.0`.
 - **Work packages:**
-  - WP 2.1 `packages/core` contract + registry + secret-file helper.
-    Gate: `pnpm run check`.
-  - WP 2.2 `servers/gateway`: HTTP server, config schema (B6/B7), guards, health, dev
-    authenticator, `telos_server_info`, result cap. Gate: `pnpm run check`.
-  - WP 2.3 E2E with the real SDK client over real HTTP on an ephemeral loopback port:
-    (a) `versionNegotiation: {mode: 'auto'}` lands on `modern`; (b) default client lands
-    on `legacy`; (c) both call `telos_server_info`; (d) `Host: 127.0.0.1:<port>`
-    accepted, `Host: evil.example` → 403, foreign `Origin` → 403, absent `Origin`
-    accepted; (e) no or invalid token → 401; (f) GET/DELETE `/mcp` → 405 and
-    `Mcp-Session-Id` ignored, never echoed; (g) config rejections: `TN_MCP_HOST=0.0.0.0`;
-    `TN_AUTH_MODE=dev` with `NODE_ENV=production`; `dev` with a non-loopback
-    `TN_MCP_PUBLIC_URL`; world-readable token file. Gate: `pnpm run check`.
-  - WP 2.4 `scripts/check-boundaries.mjs` (B1 + B2 call-site rule) in `check`.
-    Gate: `pnpm run check`, plus a probe (forbidden import and a stray `registerTool`
-    in a temp copy) showing the script fails.
-- **Security requirements:** loopback bind; Host/Origin validation; body limit 1 MiB;
-  request timeout 30 s; no stack traces in responses; `X-Accel-Buffering: no` on SSE.
-- **Acceptance:** both eras pass E2E on CI; the boundary probe fails as expected.
-- **Rollback:** repo-only.
-- **Required user actions:** none.
-- **Must NOT happen:** binding 0.0.0.0; provider credentials; deployment; `dev` auth
-  reachable outside development.
-- **Exit criteria:** WPs 2.1–2.4 landed; B1, B2 (call-site half), B6, B7 enforced.
+  - WP 2.1 mcp-common tool contract/factory/registry, central config, secret-file
+    helper, and observability primitives. Gate: `pnpm run check`.
+  - WP 2.2 Cloudflare skeleton plus thin gateway: route table, config schema (B6/B7),
+    guards, health, dev auth, header stripping, `tn_status`, result cap. Gate:
+    `pnpm run check`.
+  - WP 2.3 E2E through `/cloudflare/mcp` over real HTTP: modern auto-negotiation and
+    legacy clients both call `tn_status`; hostile Host/Origin is rejected; absent
+    Origin is accepted for non-browser clients; no/invalid token is rejected before
+    proxying; backend rejects bypass without valid auth; GET/DELETE `/mcp` is 405;
+    non-loopback binds, production dev auth, public dev URL, and a world-readable
+    token file are rejected. Gate: `pnpm run check`.
+  - WP 2.4 boundary probe: a forbidden SDK import outside mcp-common and a stray
+    registration outside `packages/mcp-common/src/policy-wrapper.ts` each fail.
+  - WP 2.5 owner-scheduled local VM gate: load the protected dev token into
+    `TN_DEV_TOKEN`, run the registration command in the relationship section, and
+    confirm Claude Code calls only `tn_status`. Remove the registration and unset the
+    variable afterward.
+- **Security requirements:** all processes bind to assigned loopback ports; gateway
+  Host/Origin validation; 1 MiB body limit; 30 s request timeout; early auth plus
+  backend re-verification; no stack traces; no provider credentials.
+- **Acceptance:** both protocol eras pass through the gateway; boundary probes fail as
+  expected; Claude Code's local call returns `tn_status` and no other tool exists.
+- **Rollback:** repo-only; local VM processes stopped and local registration removed.
+- **Required user actions:** schedule WP 2.5 on the VM.
+- **Must NOT happen:** non-loopback bind; provider credentials; production deployment;
+  development auth reachable outside development.
+- **Exit criteria:** WPs 2.1–2.5 landed; B1, B2 call-site half, B5, B6, B7 enforced.
 
 ---
 
 ### Phase 3: Policy, audit, approvals framework
 
 - **Goal:** every tool call passes authorization → policy → approval check →
-  audit-intent → execution → audit-outcome. Destructive actions are impossible without
-  a bound, single-use approval.
+  audit-intent → execution → audit-outcome. R3 actions are hard-disabled in production
+  until a bound, single-use out-of-band approval is available.
 - **Why:** the chokepoint exists before the first provider (A.5).
 - **Architecture decisions:** A.7 approval, audit, and failure contracts, plus:
-  - `packages/policy`: role → scopes map; `evaluate(principal, def, args, resources)
-    → allow | deny(reason) | approval_required(reason)`; rules can match
-    `ResourceRef.environment` (e.g. production ⇒ approval for `write`).
-    `destructive ⇒ approval` is code, not data. `policyVersion` = hash of the rule set.
+  - `packages/policy`: role → scope-set map plus the proposed domain registry (CLOUDFLARE §4.2, decision D5);
+    `evaluate(principal, def, args, resources) → allow | deny(reason) |
+    approval_required(reason)`; rules can match `ResourceRef.environment`. R2 validates
+    production targets and defaults to approval; any owner relaxation is explicit
+    policy data. `R3 ⇒ approval always` is code, not data, and R3 is unavailable in
+    production until MP 8. `policyVersion` hashes the rules.
   - `packages/audit`: A.7 audit contract; `keyId` supports HMAC key rotation (old keys
     kept read-only for `verify`); `tn-mcps audit verify [--from DATE]`.
-  - `packages/approvals`: `node:sqlite` (S4), WAL, `busy_timeout=5000`,
-    `schema_version` table, the A.7 state machine in transactions. CLI
-    `tn-mcps approvals list|show|deny` everywhere; `approve` only when
-    `NODE_ENV≠production` (B12). Every CLI action is audited through the gateway's
-    store API.
-  - `servers/gateway/src/policy-wrapper.ts`: the single registration site (B2). It adds
+  - `packages/approvals`: store/client library using `node:sqlite` (S4), WAL,
+    `busy_timeout=5000`, `schema_version`, and the A.7 state machine. The gateway is
+    the sole database writer. MCP servers and the CLI use a gateway-internal API on
+    `/run/tn-mcps/gateway.sock`; the gateway maps `SO_PEERCRED` UID to an allowlisted
+    server identity. The CLI can `list|show|deny` everywhere and `approve` only
+    outside production (B12). Phase 3 decides request schema, socket ownership,
+    timeouts, replay protection, and failure behavior.
+  - `packages/mcp-common/src/policy-wrapper.ts`: the single registration site (B2). It adds
     `approval_id` to gated tools, computes `argsHash`, runs `precondition()` at request
     and execution time, emits `isError: true` +
     `{status:'approval_required', approvalId, expiresAt, summary}`.
-  - Tools with `risk ≥ write` carry `_meta: {"anthropic/requiresUserInteraction": true}`
-    and annotations consistent with their risk (registry test).
+  - R1–R3 tools carry `_meta: {"anthropic/requiresUserInteraction": true}` and
+    annotations consistent with their risk. R3 also requires `admin:destructive`.
 - **Files:** `packages/policy/**`, `packages/audit/**`, `packages/approvals/**` (+ `bin`),
-  `servers/gateway/src/policy-wrapper.ts`.
+  `packages/mcp-common/src/policy-wrapper.ts`, gateway internal approvals API.
 - **Dependencies:** none external if S4 passes; `canonicalize` (RFC 8785) or an
   in-repo JCS implementation with test vectors from the RFC.
 - **Work packages:**
   - WP 3.1 `packages/audit` + verify CLI. Gate: `pnpm run check`.
   - WP 3.2 `packages/policy`. Gate: `pnpm run check`.
-  - WP 3.3 `packages/approvals` + CLI (S4 spike first, including two concurrent
-    writers). Gate: `pnpm run check`.
-  - WP 3.4 `policy-wrapper` + gateway integration + test-only tools
-    (`test_destructive_noop` with a `precondition` over an in-memory value).
+  - WP 3.3 `packages/approvals` + gateway-owned store/internal Unix-socket API + CLI
+    (S4 spike first; concurrent clients, one writer). Gate: `pnpm run check`.
+  - WP 3.4 mcp-common policy wrapper + server integration + test-only R3 tool
+    (`test_r3_noop` with a `precondition` over an in-memory value).
     Gate: `pnpm run check`.
 - **Security requirements:** approval IDs are random 128-bit and not authentication
   (bound to principal); the store holds `argsHash` + redacted summary, not raw args;
-  no configuration can relax `destructive ⇒ always`.
+  peer UID is checked before any store operation; no configuration can relax R3.
 - **Tests:** chain tamper detection (edit, delete, reorder, truncate, cross-day gap,
   wrong `keyId`); JCS vectors; args-hash binding (changed arg → rejected; `approval_id`
   excluded); precondition change between approval and execution → refused; expiry;
@@ -374,7 +474,7 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
   pending; crash in `executing` → `unknown_outcome`; registry invariants (B4,
   annotations); missing scope → `isError` naming the scope; audit-intent failure →
   not executed.
-- **Acceptance:** E2E: `test_destructive_noop` → approval_required → non-production CLI
+- **Acceptance:** E2E: `test_r3_noop` → approval_required → non-production CLI
   approves → re-call with `approval_id` executes once → second re-call refused →
   `audit verify` passes → a tampered file fails verify.
 - **Rollback:** repo-only.
@@ -387,8 +487,9 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 
 ### Phase 4: Authentication and authorization (Cloudflare Access)
 
-- **Goal:** the gateway authenticates real Access identities and maps them to roles,
-  and the Claude Code ↔ Access Managed OAuth path is proven before anything depends on it.
+- **Goal:** the gateway and each MCP server authenticate real Access identities with
+  route-specific audiences, and the Claude Code ↔ path-scoped Access Managed OAuth
+  path is proven before anything depends on it.
 - **Why:** S1 is the most expensive assumption.
 - **Architecture decisions:**
   - `packages/auth` `AccessJwtAuthenticator` (`jose` 6.x `createRemoteJWKSet` on
@@ -403,31 +504,39 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
       `svc:<common_name>`.
     - Unknown or ambiguous shape → 401, audited as `auth_rejected` with the claim
       *names* seen.
-  - Roles from the server-side role map. An unlisted identity is denied, not
-    defaulted to `viewer`.
-  - B5 header stripping. No own `WWW-Authenticate` in Access mode (plain 401/403).
+  - Each path has a separate Access application, policy, and AUD. The gateway selects
+    the expected AUD from the route and verifies before proxying; the destination MCP
+    independently verifies the same assertion against its own configured AUD.
+  - Roles map to scope sets. An unlisted identity is denied, not defaulted. Owner
+    Claude Code defaults to `tn:read` + `cloudflare:read`; JARVIS defaults to
+    `tn:read`, `cloudflare:read`, `github:read`, `oracle:read`.
+  - B5 header stripping and assertion forwarding. No own `WWW-Authenticate` in Access
+    mode (plain 401/403).
   - JWKS cache per A.7 failure defaults.
-- **Files:** `packages/auth/**`, gateway auth wiring, `.env.example`.
+- **Files:** `packages/auth/**`, gateway and MCP-server auth wiring, `.env.example`.
 - **Dependencies:** `jose@6.2.x`.
 - **Work packages:**
   - WP 4.0 **Auth spike (owner + Claude).**
     Step A (zero infrastructure): owner creates an MCP portal with only the public
     Cloudflare Docs server; Claude connects Claude Code and calls a docs tool.
-    Step B (the real test, owner-approved throwaway): an Access app with Managed OAuth
-    on `mcp-spike.telosnexus.cloud` fronting a throwaway Worker running a minimal SDK v2
-    MCP handler that returns the Access claim **names** it received. Claude records S1
-    (Claude Code completes OAuth), S2 (claim names), S8 (which `/.well-known/*` Access
-    serves), and S9 (session still works after > 20 min). Owner deletes the app, the
-    Worker, and the hostname afterwards.
-    Gate: `claude mcp list` shows `✔ Connected` for the spike, and one tool call
-    succeeds before and after 20 minutes. Findings are recorded in A.2.
+    Step B (the real test, owner-approved throwaway): two path-scoped Access apps with
+    Managed OAuth on one throwaway hostname, each fronting a minimal SDK v2 MCP route
+    that returns only Access claim **names**. Register both full path URLs. Record S1,
+    S2, S8, S9, and S11: each RFC 8707 resource retains its full path and each token is
+    accepted only by its matching route/AUD. Delete the apps, Worker, and hostname.
+    Gate: `claude mcp list` shows both connected; matching calls succeed, cross-AUD
+    calls fail, and a call still succeeds after 20 minutes. If S11 fails, use
+    single-label hosts such as `mcp-cloudflare.telosnexus.cloud`; do not use two-level
+    provider names because a standard one-level wildcard edge certificate does not
+    cover them. Findings are recorded in A.2.
   - WP 4.1 Verifier with tests against a locally generated JWKS (real `jose`
     verification): valid human; valid service; wrong `aud`; `aud` array without ours;
     wrong `iss`; expired; `alg: none`; HS256; unknown `kid` → refetch; JWKS down with a
     fresh cache → accepted; JWKS down with an unknown `kid` → rejected; ambiguous shapes
     (email + common_name; empty everything) → rejected. Gate: `pnpm run check`.
-  - WP 4.2 Principal/role mapping, B5 stripping, and a test that a provider handler
-    can't see the inbound credential. Gate: `pnpm run check`.
+  - WP 4.2 Principal/role/scope mapping, per-route/per-server audience validation, B5
+    stripping, assertion forwarding, and tests that a handler cannot see stripped
+    credentials and a GitHub-app token cannot reach Cloudflare. Gate: `pnpm run check`.
 - **Security requirements:** never log the JWT; audit `sub`/`email`/`common_name` only.
 - **Acceptance:** spike outcomes recorded (or the fallback chosen and ARCHITECTURE
   updated); verifier tests green.
@@ -435,25 +544,28 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 - **Required user actions:** Owner Actions §2.
 - **Must NOT happen:** building our own OAuth AS; accepting the opaque `oauth:` token
   at the origin; changing existing Telos Access applications.
-- **Exit criteria:** S1, S2, S3, S8, S9 resolved in A.2; WPs 4.1–4.2 landed.
+- **Exit criteria:** S1, S2, S3, S8, S9, S11 resolved in A.2; WPs 4.1–4.2 landed.
 
 ---
 
 ### Phase 5: Cloudflare read-only provider
 
-- **Goal:** the seven Telos read tools plus `cloudflare_api_search`, working against the
+- **Goal:** the eight curated R0 tools plus `cf_api_search`, working against the
   real account with read-only tokens.
 - **Why:** first useful capability, with no ability to mutate (B3, B10).
 - **Architecture decisions:**
-  - `providers/cloudflare`: curated tools on the official `cloudflare` SDK 7.x, wrapped
+  - `mcps/cloudflare`: curated tools on the official `cloudflare` SDK 7.x, wrapped
     in a **GET-only client** (B3); result-size contract (A.7); summarised output (IDs,
     names, statuses, counts).
   - Upstream adapter: `@modelcontextprotocol/client` 2.0.0 →
-    `https://mcp.cloudflare.com/mcp` with the server-side Token B. Only upstream tool
-    `search` is forwarded, as `cloudflare_api_search` (B10). `execute` isn't exposed.
-    If it is ever needed, it returns as a separate `write`-class tool behind approvals.
+    `https://mcp.cloudflare.com/mcp` with server-side Token B. `search` is exposed as
+    R0 `cf_api_search`. `execute` maps only to disabled-by-default R3
+    `cf_api_execute`, requires `cloudflare:admin`, and requires per-call out-of-band
+    approval showing the exact JavaScript and binding its code hash. It uses Token B
+    unless the owner explicitly provisions a write-capable token. The adapter's test
+    asserts it forwards only upstream names `search` and `execute` (B10).
   - Tools, endpoints, and tokens: CLOUDFLARE §3–4.
-- **Files:** `providers/cloudflare/**`, gateway provider registration, `.env.example`.
+- **Files:** `mcps/cloudflare/**`, shared-factory registration, `.env.example`.
 - **Dependencies:** `cloudflare@7.1.x`, `@modelcontextprotocol/client@2.0.0`.
 - **Work packages:**
   - WP 5.0 S7 spike (owner-approved, needs Token B on the VM): a script calls upstream
@@ -462,10 +574,10 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
     method = GET, path, query, and auth-header **presence**; recorded-shape fixtures;
     cursor/limit/truncation. Gate: `pnpm run check`.
   - WP 5.2 Upstream adapter with a local fake MCP server (real SDK) asserting it gets the
-    server-side credential, never the inbound one, and that a non-allowlisted tool name
-    is refused. Gate: `pnpm run check`.
+    server-side credential, never the inbound one, forwards only `search`/`execute`,
+    and enforces the R3 exact-code approval before `execute`. Gate: `pnpm run check`.
   - WP 5.3 Live read-only smoke on the VM, owner-approved:
-    `pnpm --filter @tn-mcps/provider-cloudflare run smoke` (zone and tunnel counts with
+    `pnpm --filter @tn-mcps/mcp-cloudflare run smoke` (zone and tunnel counts with
     Token A). Gate: exit 0; IDs appear in the terminal only.
 - **Security requirements:** tokens only via `*_FILE` paths and the secret-file rule;
   Cloudflare errors mapped without token text; tunnel tokens and Worker script bodies
@@ -473,23 +585,24 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 - **Tests:** as in the WPs; plus 401/403 from Cloudflare → `isError` naming the
   missing permission group.
 - **Acceptance:** all tools pass tests; S5 and S7 resolved; live smoke OK.
-- **Rollback:** `TN_PROVIDERS=` (disable); owner revokes the tokens.
+- **Rollback:** stop and disable `tn-mcp-cloudflare.service`; owner revokes the tokens.
 - **Required user actions:** Owner Actions §3.
-- **Must NOT happen:** any write-capable token; tokens in chat; running the smoke
-  without a go-ahead; proxying upstream `execute`.
+- **Must NOT happen:** a write-capable token for reads; tokens in chat; running the
+  smoke without a go-ahead; enabling `cf_api_execute` without B10's full boundary.
 - **Exit criteria:** WPs 5.0–5.3 done.
 
 ---
 
 ### Phase 6: Private ingress (dedicated tunnel, `mcp.telosnexus.cloud`, Access)
 
-- **Goal:** the gateway runs as a hardened systemd service, reachable only through
-  Cloudflare Access at `https://mcp.telosnexus.cloud/mcp`, serving **read-only** tools.
+- **Goal:** the thin gateway and Cloudflare MCP run as hardened, separately credentialed
+  systemd services, reachable only through Cloudflare Access at
+  `https://mcp.telosnexus.cloud/cloudflare/mcp`, serving R0 tools.
 - **Why:** first production exposure, only after auth and read tools are proven.
-- **Architecture decisions:** DEPLOYMENT_A1 §2–4 and CLOUDFLARE §5–6 (users `tnmcp` /
-  `tnmcp-tunnel`, split config dirs, system cloudflared, new remotely-managed tunnel
-  `tn-mcps`, Access app with Managed OAuth, pull-based deploy with the trust chain in
-  DEPLOYMENT_A1 §4).
+- **Architecture decisions:** DEPLOYMENT_A1 §2–4 and CLOUDFLARE §5–6: users
+  `tnmcp-gateway`, `tnmcp-cloudflare`, and `tnmcp-tunnel`; per-process config/secret
+  directories; dedicated `tn-mcp-*` units; new remotely-managed tunnel `tn-mcps`;
+  path-scoped Access app with Managed OAuth; pull-based deploy trust chain.
 - **Files:** `deploy/systemd/*.service`, `deploy/cloudflared/README.md`,
   `deploy/scripts/{preflight,deploy,rollback}.sh`.
 - **Dependencies:** official cloudflared package at `/usr/local/bin/cloudflared`.
@@ -499,26 +612,30 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
     <sha>`: DEPLOYMENT_A1 §4 trust chain, on-host `pnpm run check`, atomic switch,
     health, auto-rollback, schema-version check. `rollback.sh`.
     Gate: `bash -n` on each + CI dry-run against a temp prefix with a fake `systemctl`.
-  - WP 6.2 Host provisioning, **owner-approved, on the VM**: users, directories, units,
-    `daemon-reload`, enable **gateway only**; `curl -fsS 127.0.0.1:8787/healthz`; S6
-    check that `MemoryMax` shows up in the unit's cgroup
-    (`systemctl show -p MemoryMax`, cgroup `memory.limit_in_bytes`).
-    Gate: health 200; `ss -tlnp` shows `127.0.0.1:8787` only.
+  - WP 6.2 Host provisioning, **owner-approved, on the VM**: process users,
+    per-process directories, units, `daemon-reload`, enable gateway and Cloudflare MCP;
+    `curl -fsS 127.0.0.1:8790/healthz`; S6 check that each `MemoryMax` is enforced.
+    Explicit recovery tests: `systemctl kill tn-mcp-gateway.service` and
+    `systemctl kill tn-mcp-cloudflare.service` must auto-restart; the owner schedules a
+    reboot and confirms both services, health, audit chains, and tunnel recover.
+    Gate: health 200; `ss -tlnp` shows only `127.0.0.1:8790` and `127.0.0.1:8701`.
   - WP 6.3 Tunnel + DNS + Access, **owner in dashboard, Claude verifies**: tunnel
-    `tn-mcps` with published app `mcp.telosnexus.cloud → http://127.0.0.1:8787` +
-    catch-all 404; token file placed; Access app (Managed OAuth, owner Allow policy).
-    Claude enables `tn-mcps-tunnel.service`.
+    `tn-mcps` with published app `mcp.telosnexus.cloud → http://127.0.0.1:8790` +
+    catch-all 404; token file placed; path-scoped Cloudflare Access app (Managed OAuth,
+    owner Allow policy). Claude enables `tn-mcp-tunnel.service`.
     Gate: unauthenticated `POST` → 401 from Access with `WWW-Authenticate`;
-    `claude mcp add --scope local …` + login → `telos_server_info` works; a loopback
-    request without a JWT → 401 from the gateway.
-  - WP 6.4 Minimal external liveness alert (a free external uptime check on
-    `/healthz` through a separate Access-bypass path is **not** allowed, so the owner's
-    existing monitoring pings `https://mcp.telosnexus.cloud/mcp` and alerts on a
-    non-401 answer), plus a 24 h soak: RSS ≤ 256 MB, no restarts, no errors.
+    `claude mcp add --scope local …` + login → `tn_status` works; loopback requests
+    without a JWT are rejected by both gateway and backend.
+  - WP 6.4 Minimal external liveness alert: the owner's existing monitoring pings
+    `https://mcp.telosnexus.cloud/cloudflare/mcp` and alerts on any answer other than
+    Access's 401 (no Access-bypass health path is published). Then a 24 h soak per
+    process: RSS ≤ 256 MB, no restarts, no errors.
 - **Security requirements:** no inbound port; tunnel token readable only by
-  `tnmcp-tunnel`; gateway secrets readable only by `tnmcp`; optional staging host (Q10).
+  `tnmcp-tunnel`; gateway has no provider credentials; Cloudflare credentials readable
+  only by `tnmcp-cloudflare`; optional staging host (Q10).
 - **Acceptance:** WP 6.3 gates; soak clean; rollback rehearsed once.
-- **Rollback:** `systemctl disable --now tn-mcps-tunnel tn-mcps-gateway`; owner deletes
+- **Rollback:** disable/stop only `tn-mcp-tunnel.service`, `tn-mcp-gateway.service`, and
+  `tn-mcp-cloudflare.service`; owner deletes
   the tunnel route and the Access app. The existing Telos tunnel is unaffected by
   construction.
 - **Required user actions:** Owner Actions §4.
@@ -532,11 +649,12 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 
 - **Goal:** Claude Code sessions for this repo use the gateway by default with sane
   permissions.
-- **Decisions:** add `telos` to `.mcp.json` (URL only); commit `.claude/settings.json`
-  with `allow` for read tools and `ask` for write tools.
+- **Decisions:** add separate project endpoints as needed (starting with
+  `telos-cloudflare` at `/cloudflare/mcp`); commit `.claude/settings.json` with `allow`
+  for R0 tools and `ask` for R1/R2 tools.
 - **Files:** `.mcp.json`, `.claude/settings.json`, `docs/CLAUDE_CODE.md`.
 - **WP 7.1** config + docs. Gate: `pnpm run check`; fresh clone → `claude mcp list`
-  shows `telos` pending approval, then `✔ Connected` after approval + login.
+  shows `telos-cloudflare` pending approval, then `✔ Connected` after approval + login.
 - **Security requirements:** `.mcp.json` credential-free (guard-enforced). Headless
   `claude -p` loads project servers without asking, so only the gateway and public docs
   servers are listed.
@@ -573,8 +691,8 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
   - WP 8.2 Metrics + alerts. Gate: a test alert reaches the owner.
   - WP 8.3 Audit shipping + restore script. WP 8.4 Restore drill: restore into a temp
     dir with the off-VM credential; `audit verify` passes. The drill log is recorded here.
-  - WP 8.5 Approvals app + Access app (owner). Gate: Codex's falsification test. As
-    `tnmcp` and as `ubuntu`, including via a pseudo-TTY, try to approve a pending
+  - WP 8.5 Approvals app + Access app (owner). Gate: falsification test. As
+    `tnmcp-gateway`, each MCP user, and `ubuntu`, including via a pseudo-TTY, try to approve a pending
     request without the approvals-app identity. Every attempt fails. The owner's
     MFA-backed browser approval succeeds.
   - WP 8.6 S10 spike: CI release artifact + build-provenance attestation, verified on
@@ -588,11 +706,12 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 
 ### Phase 9: Cloudflare controlled writes
 
-- **Goal:** `cloudflare_dns_upsert`, `cloudflare_dns_delete` (single record),
-  `cloudflare_pages_deploy`, `cloudflare_worker_deploy`,
-  `cloudflare_tunnel_route_update`, all behind policy, approvals, and audit.
+- **Goal:** `cf_upsert_dns_record`, `cf_delete_dns_record` (single record),
+  `cf_deploy_pages`, `cf_deploy_worker`, and `cf_update_tunnel_route`, all behind
+  policy, approvals, and audit.
 - **Decisions:** Token C (CLOUDFLARE §4) injected only for write defs; each write
   defines `resources()` and `precondition()` (the current record/config hash);
+  risk is R1 only for eligible non-production targets and R2 for production targets;
   **dry-run diff** in the approval view; execution re-checks the precondition (A.7);
   idempotency: upserts are keyed by (zone, type, name) and re-applying identical
   content is a no-op; post-write read-back. A read-back mismatch after a successful
@@ -603,32 +722,32 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
   Gate per WP: `pnpm run check`.
 - **Required user actions:** Owner Actions §7.
 - **Must NOT happen:** zone deletion, nameserver change, R2/Worker/tunnel deletion tools
-  (not built without a separately approved need); bulk ops without the destructive path;
+  (not built without a separately approved need); bulk ops without the R3 path;
   any write before Phase 8 exit.
 - **Exit criteria:** all write tools landed; live test passed; audit shows the full
   trail.
 
 ---
 
-### Phase 10: GitHub provider
+### Phase 10: GitHub MCP server
 
-- **Goal:** read tools (repos, PRs, workflow runs, security alerts) and controlled
+- **Goal:** `mcps/github` with R0 tools such as `gh_list_repos` and
+  `gh_list_pull_requests`, then controlled
   writes (issues, PR comments, workflow dispatch) via a **GitHub App** (installation
   tokens, 1 h), never a PAT.
-- **Decisions:** compare proxying GitHub's official MCP server (read-only tool subset,
+- **Decisions:** compare proxying GitHub's official MCP server (R0 tool subset,
   as with B10) against Octokit curated tools. Same A.7 contracts.
 - **Required user actions:** Owner Actions §8.
 - **Must NOT happen:** repo deletion, visibility, secret, or ruleset changes without the
-  destructive path.
+  R3 path.
 
-### Phase 11: Oracle Cloud provider
+### Phase 11: Oracle MCP server
 
-- **Goal:** read tools (instances, VCN security lists, block volumes, budget) and
-  guarded writes (start/stop instance) via the OCI TypeScript SDK with a
-  least-privilege IAM user.
-- **Must NOT happen:** terminate, security-list, or IAM changes without the destructive
-  path. Any action on the A1 host itself is classified destructive (it would cut off
-  the gateway).
+- **Goal:** `mcps/oracle` with bounded `oracle_tail_service_logs`, allowlisted
+  `oracle_restart_service`, and fixed-script `oracle_deploy`, plus cloud reads where
+  needed. It never exposes a shell tool. Provider access uses least-privilege OCI IAM.
+- **Must NOT happen:** arbitrary commands; terminate, security-list, or IAM changes
+  without the R3 path. Actions that can cut off the gateway are R3.
 - **Required user actions:** Owner Actions §9.
 
 ### Phase 12: Firebase provider
@@ -639,14 +758,16 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 
 ### Phase 13: Telos internal tools
 
-- **Goal:** tools for Telos Nexus internal systems (jobs API read endpoints,
-  domain-watch status) through service-to-service credentials, never by reading another
-  service's secrets or database.
+- **Goal:** `mcps/telos-control` exposes `tn_check_domain_architecture`,
+  `tn_publish_company_site`, `tn_attach_domain`, and `tn_route_runtime`, plus approved
+  internal reads, through service-to-service credentials. It implements semantic Telos
+  workflows and never reads another service's secrets or database.
 
 ### Phase 14: Jarvis integration
 
-- **Goal:** Jarvis calls the gateway as a **service principal** (Access service token)
-  with a restricted role. It may *relay* approval requests to the owner, but it can't
+- **Goal:** Jarvis calls the relevant path endpoints as a **service principal** (Access
+  service token) with default scopes `tn:read`, `cloudflare:read`, `github:read`, and
+  `oracle:read`. It may *relay* approval requests to the owner, but it can't
   approve: service principals can never satisfy B12.
 - **Required user actions:** Owner Actions §11.
 
@@ -665,7 +786,7 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 | Q1 | Does Claude Code complete Access Managed OAuth against our own app? (S1, S2, S8, S9) | Claude runs WP 4.0; Qasim creates the spike resources | Phase 4 |
 | Q2 | Does the Telos Zero Trust plan include Managed OAuth and MCP portals, and what is the team domain? (S3) | Qasim | Phase 4 |
 | Q3 | Which IdP does Access use for the owner (Google, GitHub, one-time PIN), and does it enforce MFA? | Qasim | Phase 4 (MFA needed by Phase 8) |
-| Q4 | Which zones and records count as "production" for write approvals? | Qasim | Phase 9 |
+| Q4 | Confirm or amend the proposed D5 registry: `.io`, `.co`, `.services`, `.app`, and live-service `.cloud` routes are production; `.space` is non-production/R1-eligible. Which exceptions or record-level overrides apply? | Qasim | Phase 3 policy data; required before Phase 9 |
 | Q5 | Notification channel for alerts and approval requests: Telegram, Jarvis, or both? | Qasim | Phase 8 |
 | Q6 | License for this public repo (currently none, meaning all rights reserved)? | Qasim | non-blocking |
 | Q7 | Ubuntu 20.04: attach Ubuntu Pro (ESM) or schedule an OS upgrade? | Qasim | before Phase 6 |
@@ -685,13 +806,13 @@ Two independent read-only critiques were run on revision 1 (2026-09-15): OpenCod
 | --- | --- | --- |
 | Same-host CLI approval is self-approvable (pty bypass; `ubuntu` has passwordless sudo) | both | **Accepted.** B12 (separate Access app, audience separation, MFA); CLI approve is non-production only; B13 residual risk + Q11 |
 | `IPAddressDeny=any` would block provider egress | both | **Accepted.** Removed; B6 now bind + schema + `ss` preflight |
-| Tunnel-token ownership contradictory; parent-dir traversal | both | **Accepted.** Split `/etc/tn-mcps/{gateway,tunnel}` dirs; system cloudflared |
+| Tunnel-token ownership contradictory; parent-dir traversal | both | **Accepted.** Separate secret directories (per process in revision 3, D6); system cloudflared |
 | `gh run list` proves little; reuses an out-of-scope credential | both | **Accepted.** DEPLOYMENT_A1 §4 trust chain via the public REST API, ancestry and tree checks, on-host full gate; attested artifact as S10 |
 | TOCTOU between approval and execution | both | **Accepted.** `precondition()` in A.7 |
 | `approval_id` transport and hashing unspecified; canonicalization undefined; approver sees redacted args | OpenCode | **Accepted.** A.7 (reserved arg excluded from hash, RFC 8785 JCS, full-args view) |
 | B2 test tautological | OpenCode | **Accepted.** Call-site rule in `check-boundaries.mjs` |
 | Dev authenticator exposable through the tunnel despite loopback | Codex | **Accepted.** B7 explicit `TN_AUTH_MODE`, public-URL rule, preflight |
-| Upstream `execute()` read boundary rests on token config only | Codex | **Accepted.** Only `search` proxied (B10) |
+| Upstream `execute()` read boundary rests on token config only | Codex | **Accepted**, then superseded by D4: `search` is R0; `execute` exists only as the gated `cf_api_execute` (B10) |
 | Access principal contract loose | Codex | **Accepted.** Phase 4 claim rules |
 | Missing operational-readiness work before writes | Codex | **Accepted.** Phase 8 re-scoped as the write gate |
 | Missing assumptions (upstream bearer, RFC 9728 owner, token lifetime) | OpenCode | **Accepted.** S7–S9; S10 added |
@@ -699,6 +820,12 @@ Two independent read-only critiques were run on revision 1 (2026-09-15): OpenCod
 | `MCP_SDK_GENERATION` / `MCP_PROTOCOL_NEGOTIATION` don't exist | Codex | **Rejected.** Documented on code.claude.com/docs/en/mcp and present in the installed 2.1.272 binary (the env-vars page fetch was truncated) |
 | Prefer immutable CI artifact over an on-host rebuild | Codex | **Deferred** to WP 8.6 (S10). The baseline runs the full gate on the exact bytes it deploys |
 | Add a separate operational-readiness phase | Codex | **Merged** into Phase 8 rather than adding a 17th phase; Phase 9 is blocked on it |
+| D1 topology: separate provider MCP processes behind a thin gateway | owner contract | **Accepted for revision 3.** Supersedes revision 2's one-process rationale; shared packages retain one auth/policy/audit implementation while Unix users and Access AUDs isolate credentials and blast radius |
+| D2 risk: R0–R3 and immutable R3 approval | owner contract | **Accepted for revision 3.** Production R3 stays hard-disabled until the approvals app exists |
+| D3 exact scope vocabulary and default grants | owner contract | **Accepted for revision 3.** Roles map to scope sets; unlisted identities remain denied |
+| D4 short-prefix tool names and gated generic execution | owner contract | **Accepted for revision 3.** `cf_api_execute` is a stricter exact-code approval boundary |
+| D5 domain classification as proposed policy data | owner contract | **Accepted for revision 3.** Q4 asks the owner to confirm or amend; no automatic URL migration |
+| D6 dedicated units, Unix users, and per-process secret directories | owner contract | **Accepted for revision 3.** The generic tunnel-unit name remains reserved for the existing user service |
 
 ---
 
@@ -709,9 +836,9 @@ Where a value must reach the VM, the steps put it there directly. This command r
 from a hidden prompt, so nothing lands in shell history, logs, or chat:
 
 ```bash
-# example for a gateway secret; directories and modes per DEPLOYMENT_A1 §2
-read -rs -p 'Paste token, then Enter: ' T && printf '%s' "$T" | sudo tee /etc/tn-mcps/gateway/<name>.token >/dev/null && unset T
-sudo chown root:tnmcp /etc/tn-mcps/gateway/<name>.token && sudo chmod 0640 /etc/tn-mcps/gateway/<name>.token
+# example for a provider secret; choose the process/user from DEPLOYMENT_A1 §2
+read -rs -p 'Paste token, then Enter: ' T && printf '%s' "$T" | sudo tee /etc/tn-mcps/cloudflare/<name>.token >/dev/null && unset T
+sudo chown root:tnmcp-cloudflare /etc/tn-mcps/cloudflare/<name>.token && sudo chmod 0640 /etc/tn-mcps/cloudflare/<name>.token
 ```
 
 Detailed click-by-click instructions are written into the relevant phase when we reach
@@ -749,36 +876,45 @@ On https://github.com/heisqasim/TN-MCPs:
   secret, and not committed). Answers Q2.
 - Choose the IdP for your login and make sure it enforces MFA (Q3).
 - Step A: create a temporary MCP portal with only the Cloudflare Docs server upstream.
-  Step B: approve and create the throwaway `mcp-spike.telosnexus.cloud` Access app
-  (Managed OAuth) and Worker. Claude supplies exact steps then. Delete both afterwards.
+  Step B: approve and create two throwaway path-scoped Access apps (Managed OAuth) on
+  `mcp-spike.telosnexus.cloud` and their Worker. Claude supplies exact steps then.
+  Delete them afterwards.
 
 ### §3 Phase 5: Cloudflare read-only tokens
 
-- Create **Token A** `tn-mcps-read` and **Token B** `tn-mcps-read-upstream` with the
+- Create **Token A** `tn-mcps-read` (including **Access: Apps and Policies Read**) and
+  **Token B** `tn-mcps-read-upstream` with the
   permission groups in CLOUDFLARE §4 (account-owned preferred; requires Super
   Administrator), TTLs as listed, IP filtering on Token A only.
 - Place both on the VM with the hidden-prompt command
-  (`/etc/tn-mcps/gateway/cloudflare-read.token`, `…/cloudflare-read-upstream.token`).
+  (`/etc/tn-mcps/cloudflare/cloudflare-read.token`,
+  `/etc/tn-mcps/cloudflare/cloudflare-read-upstream.token`).
 - Approve the S7 spike (WP 5.0) and the live read-only smoke (WP 5.3).
 
 ### §4 Phase 6: Hostname, tunnel, Access, host changes
 
 - Approve the hostname **`mcp.telosnexus.cloud`** (and optionally a staging host, Q10).
-- Approve host provisioning: users `tnmcp` and `tnmcp-tunnel`; `/opt/tn-mcps`,
-  `/etc/tn-mcps/{gateway,tunnel}`, `/var/lib/tn-mcps`; the two `tn-mcps-*` units; the
-  official cloudflared package.
+- Approve host provisioning: users `tnmcp-gateway`, `tnmcp-cloudflare`,
+  `tnmcp-github`, `tnmcp-oracle`, `tnmcp-telos`, and `tnmcp-tunnel` as their phases
+  require them; `/opt/tn-mcps`, per-process `/etc/tn-mcps/<process>` directories,
+  `/var/lib/tn-mcps`, and units `tn-mcp-gateway.service`,
+  `tn-mcp-cloudflare.service`, `tn-mcp-github.service`, `tn-mcp-oracle.service`,
+  `tn-mcp-telos.service`, `tn-mcp-tunnel.service`.
 - In the dashboard (steps supplied then): create the **new** tunnel `tn-mcps`,
-  published application `mcp.telosnexus.cloud → http://127.0.0.1:8787` + catch-all 404;
+  published application `mcp.telosnexus.cloud → http://127.0.0.1:8790` + catch-all 404;
   place its token as `/etc/tn-mcps/tunnel/tunnel.token`.
-- Create the Access application for `mcp.telosnexus.cloud`: Managed OAuth on, Allow
-  policy for your email, access token lifetime per the S9 result.
+- Create separate path-scoped Access applications for
+  `mcp.telosnexus.cloud/cloudflare`, `/github`, `/oracle`, and `/telos` as each server
+  is enabled, each with its own policy and AUD; Managed OAuth on, owner Allow policy,
+  lifetime per S9. If S11 fails, approve the documented single-label-host fallback.
 - Set up the external liveness alert (WP 6.4). Approve the first production deploy.
   Decide Q7.
 
 ### §5 Phase 7: Claude Code
 
-- Approve adding `telos` to `.mcp.json` and the committed `.claude/settings.json`. Log in
-  once from your own machine (`claude mcp login telos`).
+- Approve adding `telos-cloudflare` (and later servers) to `.mcp.json` and the committed
+  `.claude/settings.json`. Log in once per server from your own machine
+  (`claude mcp login telos-cloudflare`).
 
 ### §6 Phase 8: Operational readiness
 
@@ -815,7 +951,7 @@ On https://github.com/heisqasim/TN-MCPs:
 ### §11 Phase 14: Jarvis
 
 - Create an Access **service token** for Jarvis (with a set duration), add a Service Auth
-  policy for it on the TN-MCPs Access app, store the secret in Jarvis's own secret store
+  policy for it on each path-scoped Access app it needs, store the secret in Jarvis's own secret store
   (Q9), and give Claude the **Client ID only**.
 
 ### Things Claude will never ask you for

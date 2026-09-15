@@ -1,6 +1,6 @@
 packages:
   - 'packages/*'
-  - 'providers/*'
-  - 'servers/*'
+  - 'mcps/*'
+  - 'gateway'
 
 engineStrict: true
