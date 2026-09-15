@@ -1,7 +1,12 @@
 import { registerSecretValue } from '@tn-mcps/shared';
 import { describe, expect, it } from 'vitest';
 
-import { acceptOrCreateRequestId, createLogger, newRequestId } from '../src/index.js';
+import {
+  acceptOrCreateRequestId,
+  createLogger,
+  newRequestId,
+  validRequestId,
+} from '../src/index.js';
 
 function captureDestination() {
   const lines: string[] = [];
@@ -111,5 +116,23 @@ describe('request IDs', () => {
   it('replaces array and missing inputs', () => {
     expect(acceptOrCreateRequestId(['one', 'two'])).toMatch(/^[0-9a-f-]{36}$/);
     expect(acceptOrCreateRequestId(undefined)).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe('validRequestId', () => {
+  it.each(['gateway.generated-id', 'a.b_c', 'Z'])('returns the value when %s is valid', (value) => {
+    expect(validRequestId(value)).toBe(value);
+  });
+
+  it.each(['contains space', ['array'], '', 'a'.repeat(129)])(
+    'returns undefined for %j',
+    (value) => {
+      expect(validRequestId(value)).toBeUndefined();
+    },
+  );
+
+  it('never generates an ID of its own', () => {
+    expect(validRequestId(undefined)).toBeUndefined();
+    expect(validRequestId('contains space')).toBeUndefined();
   });
 });

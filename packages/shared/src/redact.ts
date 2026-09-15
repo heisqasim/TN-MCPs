@@ -12,6 +12,7 @@ export const SECRET_KEY_PATTERNS: readonly RegExp[] = [
   /client[_-]?secret/i,
   /credential/i,
   /session/i,
+  /assertion/i,
 ];
 
 const AUTHORIZATION_VALUE_PATTERN = /\b(?:Bearer|Basic)\s+\S+/gi;

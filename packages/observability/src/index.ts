@@ -57,6 +57,11 @@ export function newRequestId(): string {
   return randomUUID();
 }
 
+/** Returns the value only when it is a syntactically valid request ID; never generates one. */
+export function validRequestId(value: string | string[] | undefined): string | undefined {
+  return typeof value === 'string' && REQUEST_ID_PATTERN.test(value) ? value : undefined;
+}
+
 export function acceptOrCreateRequestId(value: string | string[] | undefined): string {
   return typeof value === 'string' && REQUEST_ID_PATTERN.test(value) ? value : newRequestId();
 }

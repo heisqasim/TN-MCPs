@@ -29,7 +29,12 @@ import {
   type Route,
   SHUTDOWN_DRAIN_MS,
 } from '@tn-mcps/config';
-import { acceptOrCreateRequestId, createLogger, REQUEST_ID_HEADER } from '@tn-mcps/observability';
+import {
+  createLogger,
+  newRequestId,
+  REQUEST_ID_HEADER,
+  validRequestId,
+} from '@tn-mcps/observability';
 import { createHttpLifecycle, redact } from '@tn-mcps/shared';
 
 type BackendProcessName = Exclude<ProcessName, 'gateway'>;
@@ -79,10 +84,12 @@ const packageMetadata = JSON.parse(
 ) as PackageMetadata;
 const gatewayVersion = packageMetadata.version;
 
+// `content-length` is deliberately absent: the gateway forwards the bytes it actually
+// streamed and Node picks the framing (chunked), so a client-declared length must not
+// reach the backend and desync the request.
 const EXACT_REQUEST_HEADERS = new Set([
   'content-type',
   'accept',
-  'content-length',
   'mcp-protocol-version',
   'mcp-method',
   'mcp-name',
@@ -300,7 +307,8 @@ function devCredential(headers: IncomingHttpHeaders): string | undefined {
   return /^Bearer ([^\s]+)$/i.exec(authorization)?.[1];
 }
 
-function addIdentityAssertion(
+/** @internal Exported for the access-mode tripwire unit test. */
+export function addIdentityAssertion(
   forwarded: OutgoingHttpHeaders,
   headers: IncomingHttpHeaders,
   authMode: 'access' | 'dev',
@@ -318,8 +326,8 @@ function addIdentityAssertion(
   if (typeof assertion !== 'string') {
     return false;
   }
-  forwarded[ACCESS_ASSERTION_HEADER] = assertion;
-  return true;
+  // Phase 4 must verify this assertion against the route's AUD before forwarding it.
+  throw new Error('access-mode forwarding requires Phase 4 verification');
 }
 
 function contentLengthExceedsLimit(headers: IncomingHttpHeaders): boolean {
@@ -412,7 +420,10 @@ export async function startGateway(
       connectionsCheckingInterval: Math.min(headersTimeoutMs, 1_000),
     },
     (request, response) => {
-      const requestId = acceptOrCreateRequestId(request.headers[REQUEST_ID_HEADER]);
+      // The gateway always owns its request ID; a client-supplied value is kept only as
+      // a log field and never adopted, echoed, or forwarded.
+      const requestId = newRequestId();
+      const clientRequestId = validRequestId(request.headers[REQUEST_ID_HEADER]);
       request.headers[REQUEST_ID_HEADER] = requestId;
       response.setHeader(REQUEST_ID_HEADER, requestId);
       const routePath = requestPath(request);
@@ -432,6 +443,7 @@ export async function startGateway(
             principalId,
             status: response.statusCode,
             durationMs: Math.round(performance.now() - startedAt),
+            ...(clientRequestId === undefined ? {} : { clientRequestId }),
           },
           'request completed',
         );
@@ -592,6 +604,11 @@ export async function startGateway(
           }
         });
 
+        let waitingForUpstreamDrain = false;
+        const resumeDownstream = () => {
+          waitingForUpstreamDrain = false;
+          request.resume();
+        };
         const abortUpstream = () => {
           if (response.writableEnded || upstreamSettled || bodyTooLarge) {
             return;
@@ -623,8 +640,13 @@ export async function startGateway(
             return;
           }
           if (!upstreamRequest.write(buffer)) {
+            // At most one pending drain listener at a time; a fresh once('drain')
+            // per backpressured chunk would pile up listeners until Node warns.
             request.pause();
-            upstreamRequest.once('drain', () => request.resume());
+            if (!waitingForUpstreamDrain) {
+              waitingForUpstreamDrain = true;
+              upstreamRequest.once('drain', resumeDownstream);
+            }
           }
         });
         request.once('end', () => {

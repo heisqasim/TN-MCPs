@@ -30,4 +30,14 @@ describe('known-secret registry', () => {
 
     expect(scrubKnownSecrets(`${long} ${short} ${short}`)).toBe('[REDACTED] [REDACTED] [REDACTED]');
   });
+
+  it('scrubs longest-first even when the longer value was registered later', () => {
+    const short = 'jjjj-kkkk';
+    const long = 'ffff-jjjj-kkkk-gggg';
+
+    registerSecretValue(short);
+    registerSecretValue(long);
+
+    expect(scrubKnownSecrets(`A ${long} B ${short} C`)).toBe('A [REDACTED] B [REDACTED] C');
+  });
 });

@@ -30,6 +30,7 @@ export interface StartMcpBackendOptions {
   env?: Record<string, string | undefined>;
   listenPortOverride?: number;
   headersTimeoutMs?: number;
+  requestTimeoutMs?: number;
   logger?: Logger;
   installSignalHandlers?: boolean;
 }
@@ -157,10 +158,17 @@ export async function startMcpBackend(options: StartMcpBackendOptions): Promise<
     if (options.headersTimeoutMs !== undefined) {
       throw new Error('headersTimeoutMs is test-only and cannot be used in production');
     }
+    if (options.requestTimeoutMs !== undefined) {
+      throw new Error('requestTimeoutMs is test-only and cannot be used in production');
+    }
   }
   const headersTimeoutMs = options.headersTimeoutMs ?? HEADERS_TIMEOUT_MS;
   if (!Number.isFinite(headersTimeoutMs) || headersTimeoutMs <= 0) {
     throw new RangeError('headersTimeoutMs must be a positive finite number');
+  }
+  const requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
+    throw new RangeError('requestTimeoutMs must be a positive finite number');
   }
   const authenticator = createAuthenticator(config, 'backend');
   const logger =
@@ -189,9 +197,16 @@ export async function startMcpBackend(options: StartMcpBackendOptions): Promise<
       const timeout = setTimeout(() => {
         timedOut = true;
         logger.warn({ requestId }, 'request timed out');
-        sendJson(response, 504, { error: 'request timed out' });
+        if (response.headersSent) {
+          // An already-started response (e.g. an SSE stream) cannot take a status
+          // line anymore: writeHead would throw ERR_HTTP_HEADERS_SENT here and the
+          // uncaught exception would kill the process. Terminate the stream instead.
+          response.destroy();
+        } else {
+          sendJson(response, 504, { error: 'request timed out' });
+        }
         request.destroy();
-      }, REQUEST_TIMEOUT_MS);
+      }, requestTimeoutMs);
       timeout.unref();
 
       response.once('finish', () => {

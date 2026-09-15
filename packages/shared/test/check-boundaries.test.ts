@@ -106,6 +106,100 @@ describe('check-boundaries', () => {
     expect(outputOf(result)).toContain('Boundary check passed.');
   });
 
+  const templateImportSource = "const name = 'x';\nawait import(`./" + '$' + '{name}.js`);\n';
+  it.each([
+    ['identifier', `const specifier = './x.js';\nawait import(specifier);\n`, 2],
+    ['process environment', `require(process.env.SOME_MODULE);\n`, 1],
+    ['template literal', templateImportSource, 2],
+    ['concatenated', `await import('./a' + suffix);\n`, 1],
+  ])('reports a %s-based dynamic import outside mcp-common', (_name, source, line) => {
+    const directory = createRepository();
+    writeFixture(directory, 'mcps/x/src/dynamic.ts', `${source}\n`);
+
+    const result = runBoundary(directory);
+
+    expect(result.status).toBe(1);
+    expect(outputOf(result)).toContain(`mcps/x/src/dynamic.ts:${line}: B1-computed-import`);
+  });
+
+  it('allows a literal dynamic relative import', () => {
+    const directory = createRepository();
+    writeFixture(directory, 'mcps/x/src/literal.js', "await import('./relative-helper.js');\n");
+
+    const result = runBoundary(directory);
+
+    expect(result.status).toBe(0);
+    expect(outputOf(result)).toContain('Boundary check passed.');
+  });
+
+  it.each([
+    ['single-quoted bracket', "server[ 'registerTool' ]('name', {});\n", 1],
+    ['double-quoted bracket', 'server["registerResource"]("name", {});\n', 1],
+    ['template-bracket', 'server[`registerPrompt`]("name", {});\n', 1],
+    ['bracket low-level handler', "server['setRequestHandler']('x', () => ({}));\n", 1],
+    ['bracket notification handler', 'server["setNotificationHandler"]("x", () => ({}));\n', 1],
+  ])('reports %s as a B2 registration bypass', (_name, source, line) => {
+    const directory = createRepository();
+    writeFixture(directory, 'mcps/x/src/bracket.ts', source);
+
+    const result = runBoundary(directory);
+
+    expect(result.status).toBe(1);
+    expect(outputOf(result)).toContain(`mcps/x/src/bracket.ts:${line}: B2-registration-call`);
+  });
+
+  it('allows a bracket expression that is not a registration name', () => {
+    const directory = createRepository();
+    writeFixture(
+      directory,
+      'mcps/x/src/other-bracket.ts',
+      "const handlers = { get: () => ({}), set: () => ({}) };\nhandlers['get']();\n",
+    );
+
+    const result = runBoundary(directory);
+
+    expect(result.status).toBe(0);
+    expect(outputOf(result)).toContain('Boundary check passed.');
+  });
+
+  it('reports @modelcontextprotocol/core as a restricted import outside mcp-common', () => {
+    const directory = createRepository();
+    writeFixture(directory, 'mcps/x/src/core.ts', "import '@modelcontextprotocol/core';\n");
+
+    const result = runBoundary(directory);
+
+    expect(result.status).toBe(1);
+    expect(outputOf(result)).toContain('mcps/x/src/core.ts:1: B1-server-sdk-import');
+  });
+
+  it('reports a @modelcontextprotocol/core dependency outside mcp-common', () => {
+    const directory = createRepository();
+    writeFixture(
+      directory,
+      'mcps/x/package.json',
+      `${JSON.stringify({ dependencies: { '@modelcontextprotocol/core': '^2.0.0' } })}\n`,
+    );
+
+    const result = runBoundary(directory);
+
+    expect(result.status).toBe(1);
+    expect(outputOf(result)).toContain('mcps/x/package.json:1: B1-server-sdk-dependency');
+  });
+
+  it('allows @modelcontextprotocol/core inside mcp-common', () => {
+    const directory = createRepository();
+    writeFixture(
+      directory,
+      'packages/mcp-common/src/core.ts',
+      "import '@modelcontextprotocol/core';\nimport '@modelcontextprotocol/core/subpath';\n",
+    );
+
+    const result = runBoundary(directory);
+
+    expect(result.status).toBe(0);
+    expect(outputOf(result)).toContain('Boundary check passed.');
+  });
+
   it('reports restricted package dependencies outside mcp-common', () => {
     const directory = createRepository();
     writeFixture(

@@ -157,13 +157,13 @@ tracked to be hardened.
 
 | # | Boundary | Enforcement | Strength | From |
 | --- | --- | --- | --- | --- |
-| B1 | Only `packages/mcp-common` imports the MCP **server** SDK | MCP servers are built only through `createTelosMcpServer({ name, tools })`; `scripts/check-boundaries.mjs` fails CI on any import of `@modelcontextprotocol/server` outside `packages/mcp-common` | Structural + gate | 2 |
-| B2 | Every tool goes through the shared policy wrapper | `check-boundaries.mjs` fails on any SDK registration call (`registerTool`, `registerResource`, `registerPrompt`, `.tool(`) outside `packages/mcp-common/src/policy-wrapper.ts`; a test for each `mcps/*` server asserts its registered tool set equals its policy registry | Gate + test | 2 / 3 |
+| B1 | Only `packages/mcp-common` imports the MCP **server** SDK | MCP servers are built only through `createTelosMcpServer({ name, tools })`; `scripts/check-boundaries.mjs` fails CI on any import of the server SDK or its server-side packages (`/server`, `/node`, `/core`, adapters) outside `packages/mcp-common`, on npm-alias dependencies to them, and on computed dynamic imports outside mcp-common. pnpm's strict `node_modules` is the structural part: an undeclared package can't be resolved | Structural + gate | 2 |
+| B2 | Every tool goes through the shared policy wrapper | `check-boundaries.mjs` fails on any SDK registration call (`registerTool`, `registerResource`, `registerPrompt`, `setRequestHandler`, `setNotificationHandler`, including bracket notation; SDK v2 has no `.tool()` method) outside `packages/mcp-common/src/policy-wrapper.ts`; a test for each `mcps/*` server asserts its registered tool set equals its policy registry | Gate + test | 2 / 3 |
 | B3 | Read tools can't mutate | Read tools receive a **GET-only** provider client (the type exposes only `get`/`list`; a test asserts no other HTTP method is ever issued), and their token has only read permission groups | Structural (type + credential) | 5 |
 | B4 | R3 ops need a human approval every time | Registry test: `risk: 'R3'` ⇒ `approval: 'always'` and scope `admin:destructive`; the policy engine has no bypass flag; production registry refuses R3 until MP 8; approval binding tests cover args hash, precondition, principal, expiry, and single use | Test + runtime | 3 / 8 |
 | B5 | No token passthrough | After early JWT verification, the gateway strips `Authorization` and `Cookie` before proxying while forwarding `Cf-Access-Jwt-Assertion`; raw request/credentials never enter tool context. Each backend re-verifies the assertion against its own AUD. Tests prove a handler cannot observe the stripped headers or another app's token | Structural + test | 4 |
 | B6 | Every process listens on its assigned loopback address only | Typed central config rejects non-loopback binds for gateway 8790 and MCP ports 8701–8704; `preflight.sh` asserts all configured sockets with `ss -tlnp`. (No systemd `IPAddressDeny`: it would also block provider egress) | Runtime + test + gate | 2 / 6 |
-| B7 | The dev authenticator is never reachable from outside | `TN_AUTH_MODE` is explicit (`access` \| `dev`). `dev` is refused unless `NODE_ENV=development` **and** `TN_PUBLIC_BASE_URL` is unset or a loopback URL; `preflight.sh` refuses to deploy anything but `access`. Loopback bind alone is **not** isolation, because a tunnel forwards to loopback | Runtime + test + gate | 2 / 6 |
+| B7 | The dev authenticator is never reachable from outside | `TN_AUTH_MODE` is explicit (`access` \| `dev`). `dev` is refused unless `NODE_ENV=development` **and** `TN_PUBLIC_BASE_URL` is unset or a loopback URL; `preflight.sh` refuses to deploy anything but `access`. Loopback bind alone is **not** isolation, because a tunnel forwards to loopback. So in dev mode the gateway and backend also refuse any request carrying Cloudflare or proxy edge headers (`EDGE_HEADERS`: `cf-ray`, `cf-connecting-ip`, `x-forwarded-*`, `forwarded`, …), and a dev process published through a tunnel serves nothing | Runtime + test + gate | 2 / 6 |
 | B8 | No secrets in the repo | GitHub push protection + secret scanning (server-side); `scripts/guard-secrets.mjs` in `pnpm run check` and CI | Strong + weak | 1 |
 | B9 | CI can't touch the VM or secrets | GitHub-hosted runner only; `permissions: contents: read`; no secrets referenced; deploy is pull-based | Structural | 1 |
 | B10 | Generic upstream execution is an explicit R3 boundary | Upstream `search` is exposed freely as R0 `cf_api_search`. Upstream `execute` is exposed only as disabled-by-default `cf_api_execute`; enabling it requires `cloudflare:admin`, per-call out-of-band approval showing the exact JavaScript and binding its code hash, and normally the read token. A constant allowlist and test assert that the adapter forwards only upstream names `search` and `execute` | Structural + test + approval | 5 / 8 |
@@ -317,6 +317,10 @@ written (disk full, I/O error), the call is refused.
 | Provider timeout (10 s default) / 5xx | `isError` with a retry hint; writes are never auto-retried |
 | Clock not synchronized (`timedatectl`) | `preflight.sh` refuses to deploy; the gateway logs a warning each minute |
 | Rate limits | In-memory token bucket per principal; **resets on restart**, accepted and documented (R3 ops are approval-gated regardless) |
+| Rejected request (403/404/405/401/413/429/parse error) | Answer with `Connection: close` and close the socket; servers set headers 10 s / request 30 s / keep-alive 5 s timeouts |
+| Upstream fails or answers while the client body is still arriving | The gateway keeps counting (not storing) the body: over 1 MiB → 413, otherwise 503 (or the upstream's response). The body limit takes precedence over backend timing |
+| A known secret appears in output | Every value read through `readSecretFile` is registered (max 64) and scrubbed from tool results, tool errors, logs, and startup errors |
+| Client-supplied `x-request-id` | The gateway always generates its own ID; a valid client value is logged only as `clientRequestId` |
 
 ---
 
@@ -450,6 +454,14 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 - **Must NOT happen:** non-loopback bind; provider credentials; production deployment;
   development auth reachable outside development.
 - **Exit criteria:** WPs 2.1–2.5 landed; B1, B2 call-site half, B5, B6, B7 enforced.
+- **Implementation notes (2026-09-15):** WP 2.6 added hardening from two independent
+  code reviews (connection handling, edge-header tripwire, known-secret scrubbing,
+  production refusal of test-only overrides, boundary-gate bypasses, request-desync
+  prevention, backend timeout-after-headers crash). Long-lived SSE responses (e.g.
+  `subscriptions/listen`) are cut at the 30 s request timeout in Phase 2; revisit when
+  list-changed notifications are introduced. The local Claude Code gate (WP 2.5) uses
+  headless `claude -p` with `--mcp-config --strict-mcp-config` on a temporary file, so
+  it leaves no persistent client configuration behind.
 
 ---
 

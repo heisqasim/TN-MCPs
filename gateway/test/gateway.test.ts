@@ -14,7 +14,12 @@ import { EDGE_HEADERS, MAX_BODY_BYTES } from '@tn-mcps/config';
 import { type RunningMcpBackend, startMcpBackend } from '@tn-mcps/mcp-common';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { type RunningGateway, type StartGatewayOptions, startGateway } from '../src/app.js';
+import {
+  addIdentityAssertion,
+  type RunningGateway,
+  type StartGatewayOptions,
+  startGateway,
+} from '../src/app.js';
 
 const developmentCredential = ['gateway', 'integration', 'credential'].join('-');
 
@@ -240,11 +245,12 @@ describe('gateway request pipeline and header boundary', () => {
     const forwarded = receivedHeaders.at(-1);
     expect(forwarded).toMatchObject({
       host: new URL(echoUrl).host,
-      'x-request-id': 'gateway.header-test',
+      'x-request-id': expect.stringMatching(/^[0-9a-f-]{36}$/),
       'x-tn-dev-assertion': developmentCredential,
       'mcp-method': 'tools/call',
       'mcp-param-example': 'allowed',
     });
+    expect(forwarded?.['x-request-id']).not.toBe('gateway.header-test');
     expect(forwarded?.authorization).toBeUndefined();
     expect(forwarded?.cookie).toBeUndefined();
     expect(forwarded?.origin).toBeUndefined();
@@ -343,7 +349,8 @@ describe('gateway request pipeline and header boundary', () => {
     }
   });
 
-  it('allows edge headers in access mode, where the edge is expected', async () => {
+  it('does not refuse edge headers in access mode, but never forwards the unverified assertion', async () => {
+    const errors: Array<{ bindings: Record<string, unknown>; message: string }> = [];
     const accessGateway = await startGateway(
       {
         env: environment(tokenFile, { TN_AUTH_MODE: 'access' }),
@@ -359,6 +366,13 @@ describe('gateway request pipeline and header boundary', () => {
             };
           },
         },
+        logger: {
+          info() {},
+          warn() {},
+          error(bindings, message) {
+            errors.push({ bindings, message });
+          },
+        },
       },
     );
     try {
@@ -372,10 +386,24 @@ describe('gateway request pipeline and header boundary', () => {
         },
         chunks: ['{}'],
       });
-      expect(response.status).toBe(200);
-      const forwarded = receivedHeaders.at(-1);
-      expect(forwarded?.['cf-ray']).toBeUndefined();
-      expect(forwarded?.['cf-access-jwt-assertion']).toBe('access-assertion-value');
+      // The dev-mode edge-header tripwire must not fire in access mode...
+      expect(response.status).not.toBe(403);
+      // ...but the unverified assertion must not be forwarded either; the guard
+      // answers 500 and names the Phase 4 requirement in the redacted error log.
+      expect(response.status).toBe(500);
+      expect(JSON.parse(response.body)).toEqual({ error: 'internal server error' });
+      expect(errors).toEqual([
+        {
+          bindings: {
+            error: {
+              name: 'Error',
+              message: 'access-mode forwarding requires Phase 4 verification',
+            },
+            requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          },
+          message: 'unexpected request pipeline error',
+        },
+      ]);
     } finally {
       await accessGateway.close();
     }
@@ -431,7 +459,7 @@ describe('gateway request pipeline and header boundary', () => {
     expect(response.status).toBe(413);
   });
 
-  it('echoes a valid request ID and replaces an invalid one', async () => {
+  it('always serves its own request ID and never adopts a client-supplied one', async () => {
     const valid = await request(new URL('/cloudflare/mcp', gateway.url), {
       method: 'POST',
       headers: { ...authenticatedHeaders('{}'), 'x-request-id': 'valid.request-id' },
@@ -442,9 +470,45 @@ describe('gateway request pipeline and header boundary', () => {
       headers: { ...authenticatedHeaders('{}'), 'x-request-id': 'contains space' },
       chunks: ['{}'],
     });
-    expect(valid.headers['x-request-id']).toBe('valid.request-id');
+    expect(valid.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    expect(valid.headers['x-request-id']).not.toBe('valid.request-id');
     expect(invalid.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
     expect(invalid.headers['x-request-id']).not.toBe('contains space');
+  });
+
+  it('logs a syntactically valid client request ID without adopting it', async () => {
+    const completions: Array<{ bindings: Record<string, unknown>; message: string }> = [];
+    const loggedGateway = await startGateway(
+      {
+        env: environment(tokenFile),
+        listenPortOverride: 0,
+        routeTargets: { cloudflare: `${echoUrl}/mcp` },
+      },
+      {
+        logger: {
+          info(bindings, message) {
+            completions.push({ bindings, message });
+          },
+          warn() {},
+          error() {},
+        },
+      },
+    );
+    try {
+      const response = await request(new URL('/cloudflare/mcp', loggedGateway.url), {
+        method: 'POST',
+        headers: { ...authenticatedHeaders('{}'), 'x-request-id': 'valid.request-id' },
+        chunks: ['{}'],
+      });
+      expect(response.status).toBe(200);
+      expect(completions).toHaveLength(1);
+      const bindings = completions[0]?.bindings;
+      expect(bindings?.clientRequestId).toBe('valid.request-id');
+      expect(bindings?.requestId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(bindings?.requestId).not.toBe('valid.request-id');
+    } finally {
+      await loggedGateway.close();
+    }
   });
 
   it('serves health without authentication', async () => {
@@ -601,7 +665,8 @@ describe('gateway streaming and cancellation', () => {
               name: 'Error',
               message: 'Authorization: Bearer [REDACTED]',
             },
-            requestId: 'pipeline.failure-test',
+            // The gateway owns request IDs; the client value is not adopted anywhere.
+            requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
           },
           message: 'unexpected request pipeline error',
         },
@@ -723,6 +788,32 @@ interface RawResult {
   closed: Promise<number | null>;
 }
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    timer.unref();
+  });
+}
+
+/** Joins a raw chunked-response body back into its decoded payload. */
+function decodeChunkedBody(raw: string): string {
+  let decoded = '';
+  let position = 0;
+  while (position < raw.length) {
+    const lineEnd = raw.indexOf('\r\n', position);
+    if (lineEnd === -1) {
+      break;
+    }
+    const size = Number.parseInt(raw.slice(position, lineEnd), 16);
+    if (!Number.isFinite(size) || size === 0) {
+      break;
+    }
+    decoded += raw.slice(lineEnd + 2, lineEnd + 2 + size);
+    position = lineEnd + 2 + size + 2;
+  }
+  return decoded;
+}
+
 // Drives one HTTP/1.1 POST over a raw socket so tests can keep the request body open
 // while the server responds, and can observe who closes the connection and when.
 function rawPost(options: {
@@ -731,6 +822,10 @@ function rawPost(options: {
   headers?: Record<string, string>;
   body: string;
   finishBody?: boolean;
+  /** Send the body with chunked framing instead of Content-Length. */
+  chunked?: boolean;
+  /** Additionally declare this Content-Length alongside chunked framing (smuggling probe). */
+  conflictingContentLength?: string;
 }): Promise<RawResult> {
   return new Promise((resolve, reject) => {
     let raw = '';
@@ -780,16 +875,25 @@ function rawPost(options: {
     guard.unref();
 
     socket = connectTcp({ host: '127.0.0.1', port: options.port }, () => {
+      const bodyLine = options.chunked
+        ? `${Buffer.byteLength(options.body).toString(16)}\r\n${options.body}\r\n0\r\n\r\n`
+        : options.body;
       const headerLines = [
         `Host: ${options.headers?.host ?? '127.0.0.1'}`,
         ...Object.entries(options.headers ?? {})
-          .filter(([name]) => name.toLowerCase() !== 'host')
+          .filter(
+            ([name]) => name.toLowerCase() !== 'host' && name.toLowerCase() !== 'content-length',
+          )
           .map(([name, value]) => `${name}: ${value}`),
-        `Content-Length: ${Buffer.byteLength(options.body)}`,
+        ...(options.chunked ? ['Transfer-Encoding: chunked'] : []),
+        ...(options.conflictingContentLength === undefined
+          ? []
+          : [`Content-Length: ${options.conflictingContentLength}`]),
+        ...(options.chunked ? [] : [`Content-Length: ${Buffer.byteLength(options.body)}`]),
         'Connection: keep-alive',
       ];
       socket?.write(`POST ${options.path} HTTP/1.1\r\n${headerLines.join('\r\n')}\r\n\r\n`);
-      socket?.write(options.body);
+      socket?.write(bodyLine);
       if (options.finishBody !== false) {
         socket?.end();
       }
@@ -1032,5 +1136,193 @@ describe('gateway connections, overrides, and shutdown', () => {
         },
       ),
     ).rejects.toThrow('dependency overrides are test-only and cannot be used in production');
+  });
+});
+
+describe('gateway request framing', () => {
+  let directory: string;
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'tn-gateway-framing-'));
+    tokenFile = join(directory, 'dev-token');
+    await writeFile(tokenFile, developmentCredential, { mode: 0o600 });
+  });
+
+  afterAll(async () => {
+    await rm(directory, { recursive: true });
+  });
+
+  async function startFramingGateway(backendUrl: string): Promise<RunningGateway> {
+    return startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      routeTargets: { cloudflare: `${backendUrl}/mcp` },
+    });
+  }
+
+  it.each([
+    ['a chunked body', true],
+    ['a declared-length body', false],
+  ])(
+    'forwards the streamed bytes of %s without the client Content-Length',
+    async (_name, chunked) => {
+      const requests: IncomingHttpHeaders[] = [];
+      const echo = createServer((incoming, response) => {
+        let body = '';
+        incoming.on('data', (chunk: Buffer) => {
+          body += chunk.toString('utf8');
+        });
+        incoming.on('end', () => {
+          requests.push({ ...incoming.headers });
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ received: body }));
+        });
+      });
+      const echoUrl = await listen(echo);
+      const gateway = await startFramingGateway(echoUrl);
+      try {
+        const response = await rawPost({
+          port: Number(new URL(gateway.url).port),
+          path: '/cloudflare/mcp',
+          headers: authenticatedHeaders('{}'),
+          body: '{}',
+          chunked,
+          // Keep the socket open: a client half-close aborts the response before the
+          // backend has answered, which would make the forwarding itself unobservable.
+          finishBody: false,
+        });
+        // Let any misframed trailing bytes produce a phantom request before asserting.
+        await delay(100);
+
+        expect(response.response.status).toBe(200);
+        expect(JSON.parse(decodeChunkedBody(response.response.body))).toEqual({ received: '{}' });
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.['content-length']).toBeUndefined();
+        expect(requests[0]?.['transfer-encoding']).toBe('chunked');
+      } finally {
+        await gateway.close();
+        await closeServer(echo);
+      }
+    },
+  );
+
+  it('refuses a request that mixes chunked framing with a conflicting Content-Length', async () => {
+    const requests: IncomingHttpHeaders[] = [];
+    const echo = createServer((incoming, response) => {
+      requests.push({ ...incoming.headers });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{"proxied":true}');
+    });
+    const echoUrl = await listen(echo);
+    const gateway = await startFramingGateway(echoUrl);
+    try {
+      const response = await rawPost({
+        port: Number(new URL(gateway.url).port),
+        path: '/cloudflare/mcp',
+        headers: authenticatedHeaders('{}'),
+        body: '{}',
+        chunked: true,
+        conflictingContentLength: '5',
+      });
+      await delay(100);
+
+      // Node's HTTP parser refuses the TE+CL pair, so nothing is proxied and no
+      // phantom request can desync the backend.
+      expect(response.response.status).toBe(400);
+      expect(requests).toEqual([]);
+    } finally {
+      await gateway.close();
+      await closeServer(echo);
+    }
+  });
+});
+
+describe('gateway upstream backpressure', () => {
+  let directory: string;
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'tn-gateway-backpressure-'));
+    tokenFile = join(directory, 'dev-token');
+    await writeFile(tokenFile, developmentCredential, { mode: 0o600 });
+  });
+
+  afterAll(async () => {
+    await rm(directory, { recursive: true });
+  });
+
+  it('keeps at most one pending upstream drain listener while backpressuring', async () => {
+    const warnings: Error[] = [];
+    const onWarning = (warning: Error): void => {
+      warnings.push(warning);
+    };
+    process.on('warning', onWarning);
+
+    // The backend stalls before reading, so the gateway's upstream socket
+    // backpressures on every chunk beyond the socket highWaterMark.
+    const slowEcho = createServer((incoming, response) => {
+      incoming.pause();
+      setTimeout(() => {
+        let bytes = 0;
+        incoming.resume();
+        incoming.on('data', (chunk: Buffer) => {
+          bytes += chunk.byteLength;
+        });
+        incoming.on('end', () => {
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ bytes }));
+        });
+      }, 150);
+    });
+    const echoUrl = await listen(slowEcho);
+    const gateway = await startGateway({
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      routeTargets: { cloudflare: `${echoUrl}/mcp` },
+    });
+    try {
+      const chunks = Array.from({ length: 80 }, () => 'y'.repeat(4 * 1_024));
+      const response = await request(new URL('/cloudflare/mcp', gateway.url), {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${developmentCredential}`,
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+        },
+        chunks,
+      });
+      await delay(50);
+
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({ bytes: 80 * 4 * 1_024 });
+      expect(warnings.filter((warning) => warning.name === 'MaxListenersExceededWarning')).toEqual(
+        [],
+      );
+    } finally {
+      process.off('warning', onWarning);
+      await gateway.close();
+      await closeServer(slowEcho);
+    }
+  });
+});
+
+describe('addIdentityAssertion access-mode guard', () => {
+  it('refuses to forward a client access assertion in access mode', () => {
+    expect(() =>
+      addIdentityAssertion({}, { 'cf-access-jwt-assertion': 'unverified-value' }, 'access'),
+    ).toThrow('access-mode forwarding requires Phase 4 verification');
+  });
+
+  it('keeps reporting a missing assertion as a plain refusal', () => {
+    expect(addIdentityAssertion({}, {}, 'access')).toBe(false);
+  });
+
+  it('forwards the dev credential in dev mode', () => {
+    const forwarded: Record<string, unknown> = {};
+    expect(
+      addIdentityAssertion(forwarded, { authorization: 'Bearer dev-credential-value' }, 'dev'),
+    ).toBe(true);
+    expect(forwarded['x-tn-dev-assertion']).toBe('dev-credential-value');
   });
 });

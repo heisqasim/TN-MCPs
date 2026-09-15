@@ -13,7 +13,8 @@ const ALLOWLIST = new Set([
   'scripts/check-boundaries.mjs',
   'packages/shared/test/check-boundaries.test.ts',
 ]);
-const RESTRICTED_MODULE = /^@modelcontextprotocol\/(?:server|node|express|hono|fastify)(?:\/.*)?$/;
+const RESTRICTED_MODULE =
+  /^@modelcontextprotocol\/(?:server|node|express|hono|fastify|core)(?:\/.*)?$/;
 
 function lineNumberAt(content, index) {
   let line = 1;
@@ -136,13 +137,30 @@ function addImportFindings(content, path, findings) {
       }
     }
   }
+
+  // A dynamic call whose specifier is not a single plain string literal cannot be
+  // checked, so it is forbidden outside packages/mcp-common (B1-computed-import).
+  const computedDynamicPattern = /(?<![\w$.])(?:import|require)\s*\(/g;
+  for (const match of content.matchAll(computedDynamicPattern)) {
+    const callStart = content.slice(match.index, match.index + 200);
+    if (!plainStringDynamicCall.test(callStart)) {
+      addFinding(findings, path, lineNumberAt(content, match.index), 'B1-computed-import');
+    }
+  }
 }
+
+const plainStringDynamicCall = /^(?:import|require)\s*\(\s*(?:'[^'\n]*'|"[^"\n]*")\s*\)/;
 
 function addRegistrationFindings(content, path, findings) {
   const withoutComments = stripComments(content);
   const registrationPatterns = [
     [/\bregister(?:Tool|Resource|Prompt)\s*\(/g, 'B2-registration-call'],
     [/\bset(?:Request|Notification)Handler\s*\(/g, 'B2-low-level-handler-call'],
+    // Bracket-notation registration evades the plain-call patterns above.
+    [
+      /\[\s*(['"`])(register(?:Tool|Resource|Prompt)|set(?:Request|Notification)Handler)\1\s*\]\s*\(/g,
+      'B2-registration-call',
+    ],
   ];
 
   for (const [pattern, rule] of registrationPatterns) {

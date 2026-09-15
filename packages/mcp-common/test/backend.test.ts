@@ -5,7 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
 
-import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import {
+  CLIENT_CAPABILITIES_META_KEY,
+  Client,
+  PROTOCOL_VERSION_META_KEY,
+  StreamableHTTPClientTransport,
+} from '@modelcontextprotocol/client';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { DEV_ASSERTION_HEADER } from '@tn-mcps/auth';
 import { EDGE_HEADERS, MAX_BODY_BYTES } from '@tn-mcps/config';
@@ -387,6 +392,81 @@ describe('MCP backend over real HTTP', () => {
     const response = await requestWithoutFinishingBody(new URL(backend.url));
     expect(response.status).toBe(401);
     expect(JSON.parse(response.body)).toEqual({ error: 'unauthorized' });
+  });
+
+  it('terminates a long-lived SSE response at the request timeout without crashing', async () => {
+    const sseBackend = await startMcpBackend({
+      processName: 'cloudflare',
+      version,
+      env: environment(tokenFile),
+      listenPortOverride: 0,
+      requestTimeoutMs: 300,
+      logger,
+    });
+    try {
+      const port = Number(new URL(sseBackend.url).port);
+      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          [DEV_ASSERTION_HEADER]: developmentCredential,
+          'mcp-protocol-version': '2026-07-28',
+          'mcp-method': 'subscriptions/listen',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 91,
+          method: 'subscriptions/listen',
+          params: {
+            notifications: { toolsListChanged: true },
+            _meta: {
+              [PROTOCOL_VERSION_META_KEY]: '2026-07-28',
+              [CLIENT_CAPABILITIES_META_KEY]: {},
+            },
+          },
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('text/event-stream');
+
+      const startedAt = performance.now();
+      const reader = response.body?.getReader();
+      expect(reader).toBeDefined();
+      const first = await reader?.read();
+      expect(first?.done).toBe(false);
+      try {
+        while (true) {
+          const next = await reader?.read();
+          if (next?.done) {
+            break;
+          }
+        }
+      } catch {
+        // The destroyed stream surfaces as a reader error; timing is what matters.
+      }
+      const streamDurationMs = performance.now() - startedAt;
+      expect(streamDurationMs).toBeLessThan(2_000);
+
+      const recovery = new Client(
+        { name: 'timeout-recovery-client', version: '1.0.0' },
+        { versionNegotiation: { mode: 'auto' } },
+      );
+      await recovery.connect(
+        new StreamableHTTPClientTransport(new URL(sseBackend.url), {
+          requestInit: { headers: { [DEV_ASSERTION_HEADER]: developmentCredential } },
+        }),
+      );
+      try {
+        const result = await recovery.callTool({ name: 'tn_status', arguments: {} });
+        expect(result.isError).not.toBe(true);
+        expect(result.structuredContent).toMatchObject({ server: 'cloudflare' });
+      } finally {
+        await recovery.close();
+      }
+    } finally {
+      await sseBackend.close();
+    }
   });
 
   it('rejects a hostile Host header', async () => {
@@ -807,6 +887,18 @@ describe('backend startup and shutdown robustness', () => {
         logger,
       }),
     ).rejects.toThrow(/headersTimeoutMs is test-only/);
+  });
+
+  it('refuses the requestTimeoutMs override in production', async () => {
+    await expect(
+      startMcpBackend({
+        processName: 'cloudflare',
+        version,
+        env: productionEnvironment,
+        requestTimeoutMs: 250,
+        logger,
+      }),
+    ).rejects.toThrow(/requestTimeoutMs is test-only/);
   });
 
   it('removes signal handlers and closes the MCP handler when the listen port is taken', async () => {
