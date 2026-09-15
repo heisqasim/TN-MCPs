@@ -5,6 +5,8 @@
     { "path": "./packages/config" },
     { "path": "./packages/observability" },
     { "path": "./packages/auth" },
-    { "path": "./packages/mcp-common" }
+    { "path": "./packages/mcp-common" },
+    { "path": "./mcps/cloudflare" },
+    { "path": "./gateway" }
   ]
 }
