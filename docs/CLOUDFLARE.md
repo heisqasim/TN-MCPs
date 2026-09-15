@@ -141,18 +141,23 @@ tool definitions.
 The owner creates tokens in the dashboard and places them on the VM directly.
 **Tokens are never pasted into chat or committed.**
 
-### 4.2 Domain policy (proposed; the owner confirms in Q4)
+### 4.2 Domain policy (owner-decided 2026-09-15, Q4)
 
 Encoded as data in `packages/policy`. It validates R2 targets and decides R1 vs R2:
 
-| Domain | Role (owner contract §7) | Classification |
+| Domain | Role (owner contract §7) | Default classification |
 | --- | --- | --- |
 | `telosnexus.io` | canonical company identity | production |
 | `telosnexus.co` | alias / redirect to `.io` | production |
 | `telosnexus.services` | Services vertical | production |
 | `telosnexus.app` | product catalogue / app family | production |
-| `telosnexus.cloud` | cloud / runtime / infrastructure namespace | production for routes of live services |
-| `telosnexus.space` | labs / research / experiments | non-production (R1-eligible) |
+| `telosnexus.cloud` | cloud / runtime / infrastructure namespace | per hostname/resource; any live runtime route is production; unlisted hostnames are production |
+| `telosnexus.space` | labs / research / experiments | non-production by default, overridable per hostname/resource; any live service or user-facing deployment is production |
+
+**Resolution order:** exact resource rule → longest matching hostname rule →
+parent-domain default. No matching rule at all means production. Production safety is
+never inferred from the TLD alone. A live `.space` service gets an explicit production
+hostname rule, and R1 requires that no more specific rule marks the target production.
 
 The registry is not a migration engine. Existing stable production URLs, OAuth
 callbacks, Android App Links, QR codes, Firebase hosting, and public endpoints move

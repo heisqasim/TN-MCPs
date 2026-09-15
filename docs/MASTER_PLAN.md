@@ -9,13 +9,13 @@ diverge, update the plan in the same change.
 - Host: Oracle Cloud A1 VM (see [DEPLOYMENT_A1.md](DEPLOYMENT_A1.md))
 - Public endpoints: `https://mcp.telosnexus.cloud/{cloudflare,github,oracle,telos}/mcp`
 - Plan written: 2026-09-15 · Revision 3 (owner-contract alignment; see Part D) ·
-  Current phase: **1: Repository foundation**
+  Current phase: **2: Thin gateway + first MCP skeleton (in progress, owner-approved 2026-09-15)**
 
 ## Relationship to the owner's contract
 
 [`TN_MCPS_MASTER_IMPLEMENTATION_PLAN.md`](TN_MCPS_MASTER_IMPLEMENTATION_PLAN.md) is
 the architecture and security contract. This document is the execution plan that
-implements it. Where they differ, the differences are listed below for owner sign-off;
+implements it. Where they differ, the differences are listed below; the owner approved all of them on 2026-09-15;
 the contract is never silently overridden. The 0–15 numbering is retained from the
 owner's session brief.
 
@@ -46,18 +46,18 @@ providers, no autonomous destructive remediation, no Kubernetes, no distributed 
 bus, no multi-region, no custom LLM hosting, no replacing Jarvis, and no automatic
 migration of existing Telos hostnames.
 
-### Deviations requiring owner sign-off
+### Deviations (all owner-approved 2026-09-15)
 
 | Contract says | This plan does | Why | Owner action |
 | --- | --- | --- | --- |
-| Approvals may initially be local/manual | Production R3 approvals use only the separate Access approvals app; the local CLI can approve only outside production; R3 is hard-disabled in production until the app exists | AI CLIs run as `ubuntu` with passwordless sudo, so local CLI/TTY approval cannot distinguish owner from agent (B12/B13) | Sign off; decide Q11 before writes |
-| P5 safe writes follows read-only | MP 9 additionally requires MP 8 off-box audit, failure injection, restore drill, and Q11 decision | The first real mutation needs tamper-evident off-box audit and a decided agent-sudo policy | Complete MP 8 and Q11 |
-| Tunnel service example is `cloudflared.service` | Dedicated unit is `tn-mcp-tunnel.service` | A user-level unit with the generic name already serves another Telos system; reusing it is confusing and collides with `cloudflared service install` | Approve the dedicated unit |
-| Lowercase doc names and a separate `operations.md` | Session-brief names are retained; deployment/rollback live in DEPLOYMENT_A1 and incident response in SECURITY §9 until MP 8 creates `docs/OPERATIONS.md` | Preserve requested filenames and avoid a premature empty document | Sign off on filename mapping |
-| Generic provider API may sit behind an advanced/admin boundary | Upstream execution exists only as `cf_api_execute`, with exact-code, code-hash-bound, per-call approval | This is stricter and makes arbitrary JavaScript visible to the owner | Explicitly enable and provision if ever needed |
-| Layout lists top-level `tests/` and `deploy/env/` | Tests live in each package's `test/` and run from the root Vitest projects; environment files live on the host in `/etc/tn-mcps/<process>/` | Keeps tests next to code, and keeps env files, even templates, out of a public repo tree beyond `.env.example` | Sign off |
-| Flat `/etc/tn-mcps/{gateway,cloudflare,github,oracle}.env` | One `root:<process-user>` 0750 directory per process holding its env file and secret files | Per-process Unix users can't read each other's secrets (stricter; D6) | Sign off |
-| §6 examples use `te_*` names; §14 uses `tn_*` | `tn_*` everywhere | Resolves the contract's internal inconsistency in favour of §14 | Confirm the prefix |
+| Approvals may initially be local/manual | Production R3 approvals use only the separate Access approvals app; the local CLI can approve only outside production; R3 is hard-disabled in production until the app exists | AI CLIs run as `ubuntu` with passwordless sudo, so local CLI/TTY approval cannot distinguish owner from agent (B12/B13) | Approved 2026-09-15: production R3 approvals are MFA-only through the separate approvals app; local CLI approval must remain impossible in production |
+| P5 safe writes follows read-only | MP 9 additionally requires MP 8 off-box audit, failure injection, restore drill, and Q11 decision | The first real mutation needs tamper-evident off-box audit and a decided agent-sudo policy | Approved 2026-09-15: the operational-readiness gate stays before any real production write capability |
+| Tunnel service example is `cloudflared.service` | Dedicated unit is `tn-mcp-tunnel.service` | A user-level unit with the generic name already serves another Telos system; reusing it is confusing and collides with `cloudflared service install` | Approved 2026-09-15 |
+| Lowercase doc names and a separate `operations.md` | Session-brief names are retained; deployment/rollback live in DEPLOYMENT_A1 and incident response in SECURITY §9 until MP 8 creates `docs/OPERATIONS.md` | Preserve requested filenames and avoid a premature empty document | Approved 2026-09-15 |
+| Generic provider API may sit behind an advanced/admin boundary | Upstream execution exists only as `cf_api_execute`, with exact-code, code-hash-bound, per-call approval | This is stricter and makes arbitrary JavaScript visible to the owner | Approved 2026-09-15: `cf_api_execute` stays disabled by default and is not provisioned or enabled without a later explicit owner approval; if ever enabled, exact-code, code-hash-bound, single-call approval is retained |
+| Layout lists top-level `tests/` and `deploy/env/` | Tests live in each package's `test/` and run from the root Vitest projects; environment files live on the host in `/etc/tn-mcps/<process>/` | Keeps tests next to code, and keeps env files, even templates, out of a public repo tree beyond `.env.example` | Approved 2026-09-15 (per-package tests; host-side environment/secret directories) |
+| Flat `/etc/tn-mcps/{gateway,cloudflare,github,oracle}.env` | One `root:<process-user>` 0750 directory per process holding its env file and secret files | Per-process Unix users can't read each other's secrets (stricter; D6) | Approved 2026-09-15 (one isolated `/etc/tn-mcps/<process>/` directory per process) |
+| §6 examples use `te_*` names; §14 uses `tn_*` | `tn_*` everywhere | Resolves the contract's internal inconsistency in favour of §14 | Approved 2026-09-15: `tn_*` is the standard prefix |
 
 ### Cloudflare MVP definition of done
 
@@ -169,7 +169,7 @@ tracked to be hardened.
 | B10 | Generic upstream execution is an explicit R3 boundary | Upstream `search` is exposed freely as R0 `cf_api_search`. Upstream `execute` is exposed only as disabled-by-default `cf_api_execute`; enabling it requires `cloudflare:admin`, per-call out-of-band approval showing the exact JavaScript and binding its code hash, and normally the read token. A constant allowlist and test assert that the adapter forwards only upstream names `search` and `execute` | Structural + test + approval | 5 / 8 |
 | B11 | Existing VM services are untouched | `deploy.sh`/`rollback.sh`/`preflight.sh` operate only on unit names matching `tn-mcp-*` and refuse all others; the rest is prose (this plan, CLAUDE.md) | Gate + prose | 6 |
 | B12 | A production approval can't be granted by the requesting client or an agent's session | The gateway is the sole approvals-store writer. MCP servers use `/run/tn-mcps/gateway.sock`; the gateway authenticates their Unix-socket peer UID with `SO_PEERCRED`. Decisions come only through a **separate Access application** (`approve.telosnexus.cloud`) with its own AUD, owner-only policy, IdP MFA, and short session. The gateway accepts a decision only from a human `admin` who is not the requester. The local CLI can `list`/`show`/`deny` but can `approve` only when `NODE_ENV!=production` | Structural (audience + peer UID) + runtime + test | 3 / 8 |
-| B13 | Residual: an agent running as `ubuntu` on the VM (passwordless sudo) can read provider tokens and bypass every local control | **Not enforced by TN-MCPs.** Mitigation is an owner decision (Q11) that must be made before Phase 9: agents on the VM run as a non-sudo user, or passwordless sudo is removed. Until then, write-capable credentials must not exist on the VM | Owner policy | 9 |
+| B13 | Residual: an agent running as `ubuntu` on the VM (passwordless sudo) can read provider tokens and bypass every local control | **Owner decision Q11 (2026-09-15):** AI agent CLIs move to a dedicated non-sudo user before any real provider credential enters the VM (DEPLOYMENT_A1 §7). The agent-isolation check blocks credential placement until the migration is complete. `ubuntu` stays the owner's administrator account | Owner policy + gate | 5 |
 
 ### A.4 Build direction
 
@@ -242,16 +242,22 @@ The scope vocabulary is exactly: `tn:read`, `cloudflare:read`,
 `telos:deploy`, `admin:destructive`, plus `cloudflare:admin` solely for
 `cf_api_execute`.
 
-**Domain policy data** (`packages/policy`, Phase 3; proposed until Q4):
+**Domain policy data** (`packages/policy`, Phase 3; owner-decided 2026-09-15, Q4):
 
-| Domain | Intended role | Classification |
+| Domain | Intended role | Default classification |
 | --- | --- | --- |
 | `telosnexus.io` | canonical company identity | production |
 | `telosnexus.co` | alias/redirect to `.io` | production |
 | `telosnexus.services` | Services vertical | production |
 | `telosnexus.app` | product catalogue/app family | production |
-| `telosnexus.cloud` | cloud/runtime/infrastructure routes | production when the route serves a live service |
-| `telosnexus.space` | labs/research | non-production; R1 eligible |
+| `telosnexus.cloud` | cloud/runtime/infrastructure | classified per hostname/resource; any live runtime route is production; an unlisted hostname resolves to production |
+| `telosnexus.space` | labs/research | non-production by default, overridable per hostname/resource; any live service or user-facing deployment is production regardless of this default |
+
+Resolution: the **most specific rule wins**. An exact resource rule applies first, then
+the longest matching hostname rule, then the parent-domain default. A domain or hostname
+with no rule at all resolves to production. Production safety is never inferred from the
+TLD alone. R1 eligibility requires that no more specific rule marks the target
+production. Rules are reviewed policy data, and their hash is part of `policyVersion`.
 
 This registry validates R2 targets; it is not a migration engine. Stable OAuth
 callbacks, Android App Links, QR destinations, Firebase hosting, and other production
@@ -391,13 +397,19 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
     four public paths. `GET /healthz` needs no auth and returns no internals.
   - The Cloudflare skeleton re-authenticates, serves `POST /mcp`, and exposes only
     `tn_status` (version, spec revision, server name). GET/DELETE `/mcp` return 405.
-  - Phase 2 uses `DevTokenAuthenticator` with `TN_AUTH_MODE=dev` and
-    `TN_DEV_TOKEN_FILE`; both gateway and backend validate it locally under B7.
+  - Phase 2 uses `DevTokenAuthenticator` (in `packages/auth`, which Phase 4 extends
+    with the Access verifier) with `TN_AUTH_MODE=dev` and `TN_DEV_TOKEN_FILE`. Both
+    gateway and backend validate it locally under B7. The gateway strips the client's
+    `Authorization`/`Cookie` and forwards only an identity-assertion header:
+    `Cf-Access-Jwt-Assertion` in access mode, `X-TN-Dev-Assertion` in dev mode (dev and
+    loopback only). Tool code never sees either. `TN_AUTH_MODE=access` fails closed until
+    Phase 4 implements it.
   - The secret-file rule requires a regular file, not world-readable, owner-only
     (`0600`) or `0640` with the service group. Structured logs pass through `redact()`.
   - The A.7 result-size contract is enforced by mcp-common's policy-wrapper stub.
 - **Files:** `packages/mcp-common/**`, `packages/config/**`,
-  `packages/observability/**`, `gateway/**`, `mcps/cloudflare/**`,
+  `packages/observability/**`, `packages/auth/**` (authenticator interface + dev
+  authenticator), `packages/shared` (secret-file rule), `gateway/**`, `mcps/cloudflare/**`,
   `scripts/check-boundaries.mjs`, root project references, `.env.example`.
 - **Dependencies:** `@modelcontextprotocol/server@2.0.0`,
   `@modelcontextprotocol/node@2.0.0`, `hono` (^4.11.4), `pino@10`; dev:
@@ -447,7 +459,7 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
   until a bound, single-use out-of-band approval is available.
 - **Why:** the chokepoint exists before the first provider (A.5).
 - **Architecture decisions:** A.7 approval, audit, and failure contracts, plus:
-  - `packages/policy`: role → scope-set map plus the proposed domain registry (CLOUDFLARE §4.2, decision D5);
+  - `packages/policy`: role → scope-set map plus the owner-decided domain registry and its most-specific-rule-first resolution (A.7, CLOUDFLARE §4.2);
     `evaluate(principal, def, args, resources) → allow | deny(reason) |
     approval_required(reason)`; rules can match `ResourceRef.environment`. R2 validates
     production targets and defaults to approval; any owner relaxation is explicit
@@ -584,6 +596,8 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 - **Files:** `mcps/cloudflare/**`, shared-factory registration, `.env.example`.
 - **Dependencies:** `cloudflare@7.1.x`, `@modelcontextprotocol/client@2.0.0`.
 - **Work packages:**
+  - **Precondition (Q11):** the agent-user migration (DEPLOYMENT_A1 §7) is complete and
+    the agent-isolation check passes before any Cloudflare token is placed on the VM.
   - WP 5.0 S7 spike (owner-approved, needs Token B on the VM): a script calls upstream
     `search` once. Gate: exit 0 and a non-empty result.
   - WP 5.1 Curated read tools with an HTTP-level fake (undici `MockAgent`) asserting
@@ -811,14 +825,14 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 | Q1 | Does Claude Code complete Access Managed OAuth against our own app? (S1, S2, S8, S9) | Claude runs WP 4.0; Qasim creates the spike resources | Phase 4 |
 | Q2 | Does the Telos Zero Trust plan include Managed OAuth and MCP portals, and what is the team domain? (S3) | Qasim | Phase 4 |
 | Q3 | Which IdP does Access use for the owner (Google, GitHub, one-time PIN), and does it enforce MFA? | Qasim | Phase 4 (MFA needed by Phase 8) |
-| Q4 | Confirm or amend the proposed D5 registry: `.io`, `.co`, `.services`, `.app`, and live-service `.cloud` routes are production; `.space` is non-production/R1-eligible. Which exceptions or record-level overrides apply? | Qasim | Phase 3 policy data; required before Phase 9 |
+| Q4 | **Decided 2026-09-15.** Domain classification per A.7: `.io`/`.co`/`.services`/`.app` production; `.cloud` per hostname/resource (live runtime routes are production); `.space` non-production by default but overridable per hostname/resource (live or user-facing is production); most specific rule first; no rule means production | Qasim | done; encoded in Phase 3 policy data |
 | Q5 | Notification channel for alerts and approval requests: Telegram, Jarvis, or both? | Qasim | Phase 8 |
 | Q6 | License for this public repo (currently none, meaning all rights reserved)? | Qasim | non-blocking |
 | Q7 | Ubuntu 20.04: attach Ubuntu Pro (ESM) or schedule an OS upgrade? | Qasim | before Phase 6 |
 | Q8 | The VM's egress IP for Token A's IP filter | Claude (public trace endpoint) | Phase 5 |
 | Q9 | Where Jarvis stores its service-token secret | Qasim (Jarvis maintainer) | Phase 14 |
 | Q10 | Staging hostname before production in Phase 6? | Qasim | Phase 6 |
-| Q11 | **Agent sudo policy (B13):** run AI agent CLIs on the VM as a non-sudo user, or remove passwordless sudo from `ubuntu`? Without one of these, any local agent can read provider tokens directly | Qasim | before Phase 9 (strongly recommended before Phase 5) |
+| Q11 | **Decided 2026-09-15.** AI agent CLIs run as a dedicated **non-sudo** user before any real provider credential is placed on the VM. The `ubuntu` administrator account is not changed. The migration is prepared in DEPLOYMENT_A1 §7, is not performed in Phase 2 without separate approval, and is enforced before credentials enter the system (WP 5.0 precondition) | Qasim | before Phase 5 WP 5.0 |
 
 ---
 
@@ -851,6 +865,7 @@ Two independent read-only critiques were run on revision 1 (2026-09-15): OpenCod
 | D4 short-prefix tool names and gated generic execution | owner contract | **Accepted for revision 3.** `cf_api_execute` is a stricter exact-code approval boundary |
 | D5 domain classification as proposed policy data | owner contract | **Accepted for revision 3.** Q4 asks the owner to confirm or amend; no automatic URL migration |
 | D6 dedicated units, Unix users, and per-process secret directories | owner contract | **Accepted for revision 3.** The generic tunnel-unit name remains reserved for the existing user service |
+| Owner decisions 2026-09-15: all 8 deviations approved; MFA-only production R3 approvals with no production CLI approval; operational-readiness gate kept; `tn-mcp-tunnel.service`; per-package tests and host-side env/secret dirs; one isolated `/etc/tn-mcps/<process>/`; `tn_*`; `cf_api_execute` disabled unless later approved; Q11 non-sudo agent user; Q4 most-specific hostname/resource classification | owner | **Recorded.** Deviations table, A.7, Part C, B13, WP 5.0, Owner Actions, CLOUDFLARE §4.2, SECURITY §2/§5, DEPLOYMENT_A1 §7 |
 
 ---
 
@@ -892,8 +907,9 @@ On https://github.com/heisqasim/TN-MCPs:
      to pass** → add `check`. Create.
 4. **Settings → Actions → Runners**: confirm no self-hosted runners. Never add this VM.
 5. Decide a license (Q6).
-6. Decide the agent sudo policy (Q11). Recommended: run AI agent CLIs on the VM under a
-   dedicated non-sudo user before any Cloudflare token is placed on the VM (Phase 5).
+6. ~~Decide the agent sudo policy (Q11).~~ Decided 2026-09-15: dedicated non-sudo agent user
+   before any provider credential. Approve the migration run when it is scheduled
+   (DEPLOYMENT_A1 §7).
 
 ### §2 Phase 4: Access and auth spike
 
@@ -907,6 +923,8 @@ On https://github.com/heisqasim/TN-MCPs:
 
 ### §3 Phase 5: Cloudflare read-only tokens
 
+- First, approve and complete the agent-user migration (DEPLOYMENT_A1 §7). No token is
+  placed until the agent-isolation check passes.
 - Create **Token A** `tn-mcps-read` (including **Access: Apps and Policies Read**) and
   **Token B** `tn-mcps-read-upstream` with the
   permission groups in CLOUDFLARE §4 (account-owned preferred; requires Super
