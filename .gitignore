@@ -1,0 +1,43 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.turbo/
+.cache/
+
+# Secrets and local environment — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.token
+*credentials*.json
+!**/test/fixtures/**/credentials*.json
+cert.json
+.cloudflared/
+
+# Local runtime state (audit logs, approval stores, sqlite) — lives outside the repo in production
+var/
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+
+# Local Claude Code / agent state
+.claude/settings.local.json
+.claude/*.local.*
+.delegate/
+
+# Editors and OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
