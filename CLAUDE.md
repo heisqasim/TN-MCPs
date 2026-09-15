@@ -145,7 +145,7 @@ When unsure, classify higher. Bulk ops are R3. The domain classification is in
 
 ## Deployment (Phase 6+)
 
-Pull-based and owner-approved per deploy: `deploy/scripts/deploy.sh <sha>` verifies a
+Pull-based and owner-approved per deploy: `deploy/scripts/deploy.sh <full-40-char-sha>` verifies a
 successful push-on-`main` CI run for that exact SHA via the public GitHub API, checks
 ancestry and tree identity, runs the full gate on the VM, switches atomically, restarts
 only `tn-mcp-*` units, checks health and auth through each path, and rolls back

@@ -41,6 +41,11 @@ claude mcp add --transport http --scope local tn-local http://127.0.0.1:8790/clo
 
 The token is never committed or pasted into chat.
 
+The contract's §25 non-goals apply unchanged: no large dashboard, no dozens of
+providers, no autonomous destructive remediation, no Kubernetes, no distributed message
+bus, no multi-region, no custom LLM hosting, no replacing Jarvis, and no automatic
+migration of existing Telos hostnames.
+
 ### Deviations requiring owner sign-off
 
 | Contract says | This plan does | Why | Owner action |
@@ -50,6 +55,9 @@ The token is never committed or pasted into chat.
 | Tunnel service example is `cloudflared.service` | Dedicated unit is `tn-mcp-tunnel.service` | A user-level unit with the generic name already serves another Telos system; reusing it is confusing and collides with `cloudflared service install` | Approve the dedicated unit |
 | Lowercase doc names and a separate `operations.md` | Session-brief names are retained; deployment/rollback live in DEPLOYMENT_A1 and incident response in SECURITY §9 until MP 8 creates `docs/OPERATIONS.md` | Preserve requested filenames and avoid a premature empty document | Sign off on filename mapping |
 | Generic provider API may sit behind an advanced/admin boundary | Upstream execution exists only as `cf_api_execute`, with exact-code, code-hash-bound, per-call approval | This is stricter and makes arbitrary JavaScript visible to the owner | Explicitly enable and provision if ever needed |
+| Layout lists top-level `tests/` and `deploy/env/` | Tests live in each package's `test/` and run from the root Vitest projects; environment files live on the host in `/etc/tn-mcps/<process>/` | Keeps tests next to code, and keeps env files, even templates, out of a public repo tree beyond `.env.example` | Sign off |
+| Flat `/etc/tn-mcps/{gateway,cloudflare,github,oracle}.env` | One `root:<process-user>` 0750 directory per process holding its env file and secret files | Per-process Unix users can't read each other's secrets (stricter; D6) | Sign off |
+| §6 examples use `te_*` names; §14 uses `tn_*` | `tn_*` everywhere | Resolves the contract's internal inconsistency in favour of §14 | Confirm the prefix |
 
 ### Cloudflare MVP definition of done
 
@@ -282,8 +290,9 @@ and sets `truncated: true`. It never silently drops data.
 **Audit contract** (Phase 3): each process has its own chain under
 `/var/lib/tn-mcps/audit/<process>/`. One record per line, JCS-serialized; fields `v`, `ts`,
 `seq`, `keyId`, `prevHash`, `hmac`, `correlationId`, principal (`kind`, `id`),
-`clientInfo`, `tool`, `risk`, redacted `args`, `decision`, `approvalId?`, `outcome`,
-`durationMs`, `upstreamRequestIds`. The chain continues across daily files (the first
+`clientInfo`, `server`, `tool`, `risk`, `target` (from `resources()`, e.g.
+`telosnexus.io`), redacted `args`, `decision`, `approvalId?`, `outcome`,
+`upstreamErrorClass?`, `durationMs`, `upstreamRequestIds`. The chain continues across daily files (the first
 record of day N+1 carries the hash of day N's last record). Each process is the sole
 writer of its own chain and appends with fsync. A partial last line found at startup is kept,
 and a `recovery` record is appended that names it. If the intent record can't be
@@ -395,7 +404,9 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
   `@modelcontextprotocol/client@2.0.0`.
 - **Work packages:**
   - WP 2.1 mcp-common tool contract/factory/registry, central config, secret-file
-    helper, and observability primitives. Gate: `pnpm run check`.
+    helper, observability primitives, and graceful shutdown (on SIGTERM: stop
+    accepting, drain in-flight requests for up to 25 s, close the handler, flush audit;
+    systemd's default stop timeout is longer). Gate: `pnpm run check`.
   - WP 2.2 Cloudflare skeleton plus thin gateway: route table, config schema (B6/B7),
     guards, health, dev auth, header stripping, `tn_status`, result cap. Gate:
     `pnpm run check`.
@@ -404,7 +415,12 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
     Origin is accepted for non-browser clients; no/invalid token is rejected before
     proxying; backend rejects bypass without valid auth; GET/DELETE `/mcp` is 405;
     non-loopback binds, production dev auth, public dev URL, and a world-readable
-    token file are rejected. Gate: `pnpm run check`.
+    token file are rejected. Protocol negatives: a wrong `Content-Type` or `Accept`, a
+    malformed JSON-RPC body, an unsupported `MCP-Protocol-Version`
+    (`UnsupportedProtocolVersionError`), an unknown method (`-32601`), and missing or
+    mismatched `Mcp-Method`/`Mcp-Name` (`HeaderMismatch`) are each rejected; a client
+    disconnect mid-request cancels the work; SIGTERM drains in-flight calls.
+    Gate: `pnpm run check`.
   - WP 2.4 boundary probe: a forbidden SDK import outside mcp-common and a stray
     registration outside `packages/mcp-common/src/policy-wrapper.ts` each fail.
   - WP 2.5 owner-scheduled local VM gate: load the protected dev token into
@@ -687,8 +703,12 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 - **Work packages:**
   - WP 8.1 Failure-injection tests for every row of A.7 failure defaults (missing
     secret, JWKS down, audit disk-full via a small tmpfs, sqlite lock, provider timeout,
-    crash in `executing`). Gate: `pnpm run check`.
-  - WP 8.2 Metrics + alerts. Gate: a test alert reaches the owner.
+    provider rate limiting (429: R0 retries at most twice with backoff; writes never),
+    provider auth revoked, origin network failure, client disconnect mid-call, crash in
+    `executing`). Gate: `pnpm run check`.
+  - WP 8.2 Metrics + alerts. Metrics (no sensitive labels): calls per tool, denied
+    calls, approval-required count, auth failures, provider error rate by error class,
+    p50/p95 latency per tool, service restarts. Gate: a test alert reaches the owner.
   - WP 8.3 Audit shipping + restore script. WP 8.4 Restore drill: restore into a temp
     dir with the off-VM credential; `audit verify` passes. The drill log is recorded here.
   - WP 8.5 Approvals app + Access app (owner). Gate: falsification test. As
@@ -737,6 +757,9 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
   tokens, 1 h), never a PAT.
 - **Decisions:** compare proxying GitHub's official MCP server (R0 tool subset,
   as with B10) against Octokit curated tools. Same A.7 contracts.
+- **Tests:** repo reads; the branch/PR lifecycle (create branch → open PR → comment →
+  close) in a dedicated test repository; repo deletion, secrets, and ruleset changes
+  refused outside the R3 path.
 - **Required user actions:** Owner Actions §8.
 - **Must NOT happen:** repo deletion, visibility, secret, or ruleset changes without the
   R3 path.
@@ -746,6 +769,8 @@ Acceptance criteria · Rollback · Required user actions · Must NOT happen · E
 - **Goal:** `mcps/oracle` with bounded `oracle_tail_service_logs`, allowlisted
   `oracle_restart_service`, and fixed-script `oracle_deploy`, plus cloud reads where
   needed. It never exposes a shell tool. Provider access uses least-privilege OCI IAM.
+- **Tests:** health; allowlisted restart; a forbidden service name is refused and
+  audited; log reads are bounded.
 - **Must NOT happen:** arbitrary commands; terminate, security-list, or IAM changes
   without the R3 path. Actions that can cut off the gateway are R3.
 - **Required user actions:** Owner Actions §9.
