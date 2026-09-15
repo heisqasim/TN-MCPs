@@ -11,16 +11,17 @@ Before changing anything, read in this order:
    security contract**. Read it completely. Never edit it without the owner.
 2. This file.
 3. `docs/MASTER_PLAN.md`: the execution plan that implements the contract (current
-   phase, the contract→phase mapping, the deviations awaiting owner sign-off, and the
+   phase, the contract→phase mapping, the owner-approved deviations, and the
    binding contracts in §A.7).
 
 ## Current phase
 
-**Phase 1: repository foundation.** It is done when every Phase 1 exit criterion in
-`docs/MASTER_PLAN.md` is met: bootstrap commits on `main`, CI green on GitHub, and
-Owner Actions §1 applied or scheduled.
-Next: **Phase 2: thin gateway + first MCP skeleton** (local, loopback-only, `tn_status`
-only, no provider credentials, no deployment). This is the contract's P1.
+**Phase 2: thin gateway + first MCP skeleton** (contract P1) is complete on PR #2
+(branch `phase-2-gateway-skeleton`), pending the owner's merge to `main`. It is local
+and loopback-only: `tn_status` only, no provider credentials, no DNS/Access/Tunnel
+changes, no deployment. Next: **Phase 3: policy, audit, approvals framework**, which
+starts only after PR #2 is merged. Phase 1 is complete apart from the owner's GitHub
+settings (Owner Actions §1).
 Don't start a phase until its predecessor's exit criteria are met.
 
 ## Architecture in one screen
@@ -112,7 +113,9 @@ directory.
 8. The A1 VM is never a self-hosted runner for this public repo. CI runs on
    GitHub-hosted runners with `permissions: contents: read`.
 9. You likely run as `ubuntu` with passwordless sudo on this VM. That doesn't make
-   sudo in scope: use it only for actions the owner explicitly approved.
+   sudo in scope: use it only for actions the owner explicitly approved. Per Q11, agent
+   CLIs move to a dedicated non-sudo user before any provider credential reaches the VM
+   (DEPLOYMENT_A1 §7). Don't perform that migration without separate approval.
 
 ## Forbidden without explicit, in-conversation owner approval
 
@@ -141,7 +144,8 @@ doesn't carry over to the next action.
 | R3 | delete zone, change nameservers, delete R2 bucket/Worker/Pages/tunnel, bulk DNS, credential changes, `cf_api_execute` | `admin:destructive` + single-use owner approval bound to exact args + state, every time |
 
 When unsure, classify higher. Bulk ops are R3. The domain classification is in
-`docs/CLOUDFLARE.md` §4.2 (the owner confirms it in Q4).
+`docs/CLOUDFLARE.md` §4.2 (owner-decided; the most specific hostname/resource rule wins,
+and no rule means production).
 
 ## Deployment (Phase 6+)
 

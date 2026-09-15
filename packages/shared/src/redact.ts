@@ -1,3 +1,5 @@
+import { scrubKnownSecrets } from './known-secrets.js';
+
 export const SECRET_KEY_PATTERNS: readonly RegExp[] = [
   /token/i,
   /secret/i,
@@ -10,6 +12,7 @@ export const SECRET_KEY_PATTERNS: readonly RegExp[] = [
   /client[_-]?secret/i,
   /credential/i,
   /session/i,
+  /assertion/i,
 ];
 
 const AUTHORIZATION_VALUE_PATTERN = /\b(?:Bearer|Basic)\s+\S+/gi;
@@ -40,7 +43,7 @@ function isSecretKey(key: string): boolean {
 }
 
 function redactString(value: string): string {
-  let result = value;
+  let result = scrubKnownSecrets(value);
   for (const pattern of SECRET_VALUE_PATTERNS) {
     result = result.replace(pattern, (match: string) => {
       if (pattern === JWT_VALUE_PATTERN && match.length < 60) {

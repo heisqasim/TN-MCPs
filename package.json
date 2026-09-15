@@ -13,7 +13,8 @@
     "format": "biome format --write .",
     "test": "vitest run",
     "guard": "node scripts/guard-secrets.mjs",
-    "check": "biome ci . && tsc -b && vitest run && node scripts/guard-secrets.mjs"
+    "check": "biome ci . && tsc -b && vitest run && node scripts/guard-secrets.mjs && node scripts/check-boundaries.mjs",
+    "boundaries": "node scripts/check-boundaries.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.13",

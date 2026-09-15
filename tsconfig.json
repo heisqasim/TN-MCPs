@@ -1,4 +1,12 @@
 {
   "files": [],
-  "references": [{ "path": "./packages/shared" }]
+  "references": [
+    { "path": "./packages/shared" },
+    { "path": "./packages/config" },
+    { "path": "./packages/observability" },
+    { "path": "./packages/auth" },
+    { "path": "./packages/mcp-common" },
+    { "path": "./mcps/cloudflare" },
+    { "path": "./gateway" }
+  ]
 }

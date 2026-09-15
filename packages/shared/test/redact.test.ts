@@ -25,6 +25,16 @@ describe('redact', () => {
     );
   });
 
+  it('key-redacts assertion-carrying keys such as dev and access assertions', () => {
+    expect(
+      redact({ 'x-tn-dev-assertion': 'sent-value', 'cf-access-jwt-assertion': 'jwt-value', ok: 1 }),
+    ).toEqual({
+      'x-tn-dev-assertion': '[REDACTED]',
+      'cf-access-jwt-assertion': '[REDACTED]',
+      ok: 1,
+    });
+  });
+
   it('replaces cycles', () => {
     const input: Record<string, unknown> = { name: 'root' };
     input.self = input;

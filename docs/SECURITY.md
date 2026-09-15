@@ -42,7 +42,7 @@ committed byte is read by an attacker.
 | Deploy | Untested/non-main bytes | Public CI proof, ancestry/tree identity, on-host full gate, atomic switch, health check, rollback |
 | A1 neighbors | Damage to existing Telos services | Dedicated users/units/tunnel; script unit allowlist `tn-mcp-*`; no inbound rule |
 | Prompt injection | Provider data tells a model to mutate | Model cannot approve; R3 exact-args/state approval; policy is server-side |
-| **Residual B13** | Agent as passwordless-sudo `ubuntu` reads secrets or edits stores | Outside TN-MCPs. Owner must use a non-sudo agent user or remove passwordless sudo before write credentials; strongly recommended before read credentials |
+| **Residual B13** | Agent as passwordless-sudo `ubuntu` reads secrets or edits stores | Owner decision Q11 (2026-09-15): AI agent CLIs move to a dedicated non-sudo user before any real provider credential enters the VM (DEPLOYMENT_A1 §7); the agent-isolation check blocks credential placement until then. `ubuntu` stays the owner's admin account |
 
 ## 3. Process and credential isolation
 
@@ -115,9 +115,12 @@ identities are denied. Owner Claude Code defaults to `tn:read` + `cloudflare:rea
 JARVIS defaults to read scopes for TN, Cloudflare, GitHub, and Oracle. No normal client
 gets `admin:destructive`.
 
-`packages/policy` stores the proposed domain registry from CLOUDFLARE §4. Production
-includes `.io`, `.co`, `.services`, `.app`, and live-service `.cloud` routes; `.space`
-is non-production/R1-eligible. Q4 requires owner confirmation. Existing stable URLs,
+`packages/policy` stores the owner-decided domain registry (CLOUDFLARE §4.2, Q4). The most
+specific rule wins: resource, then hostname, then parent-domain default. No rule means
+production, and production safety is never inferred from the TLD alone. `.io`, `.co`,
+`.services`, `.app` default to production; `.cloud` is classified per hostname/resource
+(live runtime routes are production); `.space` defaults to non-production but any live or
+user-facing deployment there is production. Existing stable URLs,
 OAuth callbacks, Android App Links, QR codes, Firebase hosting, and public endpoints
 are migrated only deliberately.
 

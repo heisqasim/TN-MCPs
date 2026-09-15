@@ -21,7 +21,7 @@ Status: planning only. No deployment action has run; §1 is the read-only audit 
 | Docker | absent; LXD present | Native systemd; no Docker introduced |
 | cloudflared | 2026.9.1 in a user home | Install official system binary for the dedicated TN-MCPs unit |
 | Existing tunnel | user-level `cloudflared.service` for another Telos service | Never touch it; a same-named system unit would be confusing and collide with `cloudflared service install` |
-| Sudo | AI CLIs run as passwordless-sudo `ubuntu` | Residual B13; Q11 required before writes |
+| Sudo | AI CLIs run as passwordless-sudo `ubuntu` | Residual B13. Q11 decided: dedicated non-sudo agent user before any provider credential (§7) |
 | Firewall | inbound allow 22/443/established/loopback/LXD, reject rest | Add no inbound rule |
 | Existing services | JARVIS, jobs API/tunnel/Litestream, local LLMs | Never restart or reconfigure |
 | Ports | 8790 and 8701–8704 free | Central port map chosen; preflight rechecks |
@@ -242,3 +242,34 @@ chain verification. The restore drill must pass before Phase 9.
   auth on the host, or deploy without owner approval.
 - Never let gateway read provider tokens or one provider user read another's files.
 - Never roll back across an unsupported live schema.
+
+## 7. Agent-user migration (Q11: prepared, not executed)
+
+Owner decision (2026-09-15): AI agent CLIs (Claude Code, Codex, OpenCode, Antigravity)
+run as a dedicated **non-sudo** user before any real provider credential is placed on
+the VM. The `ubuntu` administrator account is not changed. The migration is **not**
+performed in Phase 2. It runs only with separate owner approval, and it must be complete
+before MASTER_PLAN WP 5.0.
+
+Plan:
+
+1. Create the user `tnagent`: login shell for interactive CLI use; no sudo rights; not in
+   `sudo`, `adm`, `lxd`, `docker`, or any `tnmcp-*` group.
+2. Clone TN-MCPs under `/home/tnagent/`. Node is the shared system binary; pnpm is
+   installed to the user's own prefix.
+3. The owner re-authenticates each agent CLI as `tnagent` with browser/device logins.
+   **No credential file is copied from `ubuntu`'s home.**
+4. Git access for `tnagent`: a credential limited to this repository (contents and pull
+   requests; no admin, no workflow or secret management), chosen and created by the
+   owner when the migration is scheduled.
+5. Root-requiring work (Phase 6 provisioning) stays with the owner as `ubuntu`, each
+   action approved individually.
+
+Enforcement: an agent-isolation check is added with the migration and reused by Phase 6's
+`preflight.sh`. It blocks credential placement unless all of these hold:
+
+- `sudo -l -U tnagent` reports no sudo rights;
+- `tnagent` can't traverse or read any `/etc/tn-mcps/<process>/` directory;
+- no agent CLI process (`claude`, `codex`, `opencode`, `agy`) is running as `ubuntu`.
+
+Accepted residual: the owner acting as `ubuntu` keeps root, as administrator access.
